@@ -48,6 +48,7 @@ class M3UAccountProfileSerializer(serializers.ModelSerializer):
             "max_streams",
             "is_active",
             "is_default",
+            "is_backup_only",
             "current_viewers",
             "search_pattern",
             "replace_pattern",

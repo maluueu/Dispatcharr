@@ -8,6 +8,10 @@ import requests
 import subprocess
 import gevent
 import re
+from typing import List, Optional
+import subprocess
+import gevent
+import re
 from typing import Optional, List
 from django.db import connection
 from django.shortcuts import get_object_or_404
@@ -15,7 +19,7 @@ from urllib3.exceptions import ReadTimeoutError
 from apps.proxy.config import TSConfig as Config
 from apps.channels.models import Channel, Stream
 from apps.m3u.models import M3UAccount, M3UAccountProfile
-from core.models import UserAgent, CoreSettings
+from core.models import CoreSettings, UserAgent
 from core.utils import log_system_event
 from .stream_buffer import StreamBuffer
 from .utils import detect_stream_type, get_logger
@@ -251,8 +255,6 @@ class StreamManager:
                 # Connection retry loop for current URL
                 while self.running and self.retry_count < self.max_retries and not url_failed and not self.needs_stream_switch:
 
-                    logger.info(f"Connection attempt {self.retry_count + 1}/{self.max_retries} for URL: {self.url} for channel {self.channel_id}")
-
                     # Handle connection based on whether we transcode or not
                     connection_result = False
                     try:
@@ -358,7 +360,9 @@ class StreamManager:
 
                 # If URL failed and we're still running, try switching to another stream
                 if url_failed and self.running:
-                    logger.info(f"URL {self.url} failed after {self.retry_count} attempts, trying next stream for channel: {self.channel_id}")
+                    logger.info(
+                        f"URL {self.url} failed after {self.retry_count} attempts, trying next stream for channel: {self.channel_id}"
+                    )
 
                     # Try to switch to next stream
                     switch_result = self._try_next_stream()

@@ -226,6 +226,11 @@ class Stream(models.Model):
             if profile.is_active == False:
                 continue
 
+            # Skip backup-only profiles during normal selection
+            # They are only used when DNS resolution fails on primary profiles
+            if profile.is_backup_only:
+                continue
+
             profile_connections_key = f"profile_connections:{profile.id}"
             current_connections = int(redis_client.get(profile_connections_key) or 0)
 
@@ -455,6 +460,11 @@ class Channel(models.Model):
 
             for profile in profiles:
                 has_active_profiles = True
+
+                # Skip backup-only profiles during normal selection
+                # They are only used when DNS resolution fails on primary profiles
+                if profile.is_backup_only:
+                    continue
 
                 profile_connections_key = f"profile_connections:{profile.id}"
                 current_connections = int(

@@ -1,10 +1,11 @@
-from django.db import models
-from django.core.exceptions import ValidationError
-from core.models import UserAgent
 import re
+
+from django.core.exceptions import ValidationError
+from django.db import models
 from django.dispatch import receiver
-from apps.channels.models import StreamProfile
 from django_celery_beat.models import PeriodicTask
+
+from apps.channels.models import StreamProfile
 from core.models import CoreSettings, UserAgent
 
 CUSTOM_M3U_ACCOUNT_NAME = "custom"
@@ -264,10 +265,10 @@ class M3UAccountProfile(models.Model):
     )
     current_viewers = models.PositiveIntegerField(default=0)
     custom_properties = models.JSONField(
-        default=dict, 
-        blank=True, 
-        null=True, 
-        help_text="Custom properties for storing account information from provider (e.g., XC account details, expiration dates)"
+        default=dict,
+        blank=True,
+        null=True,
+        help_text="Custom properties for storing account information from provider (e.g., XC account details, expiration dates)",
     )
 
     class Meta:
@@ -284,13 +285,14 @@ class M3UAccountProfile(models.Model):
         """Get account expiration date from custom properties if available"""
         if not self.custom_properties:
             return None
-        
-        user_info = self.custom_properties.get('user_info', {})
-        exp_date = user_info.get('exp_date')
-        
+
+        user_info = self.custom_properties.get("user_info", {})
+        exp_date = user_info.get("exp_date")
+
         if exp_date:
             try:
                 from datetime import datetime
+
                 # XC exp_date is typically a Unix timestamp
                 if isinstance(exp_date, (int, float)):
                     return datetime.fromtimestamp(exp_date)
@@ -302,46 +304,47 @@ class M3UAccountProfile(models.Model):
                         return datetime.fromisoformat(exp_date)
             except (ValueError, TypeError):
                 pass
-        
+
         return None
 
     def get_account_status(self):
         """Get account status from custom properties if available"""
         if not self.custom_properties:
             return None
-        
-        user_info = self.custom_properties.get('user_info', {})
-        return user_info.get('status')
+
+        user_info = self.custom_properties.get("user_info", {})
+        return user_info.get("status")
 
     def get_max_connections(self):
         """Get maximum connections from custom properties if available"""
         if not self.custom_properties:
             return None
-        
-        user_info = self.custom_properties.get('user_info', {})
-        return user_info.get('max_connections')
+
+        user_info = self.custom_properties.get("user_info", {})
+        return user_info.get("max_connections")
 
     def get_active_connections(self):
         """Get active connections from custom properties if available"""
         if not self.custom_properties:
             return None
-        
-        user_info = self.custom_properties.get('user_info', {})
-        return user_info.get('active_cons')
+
+        user_info = self.custom_properties.get("user_info", {})
+        return user_info.get("active_cons")
 
     def get_last_refresh(self):
         """Get last refresh timestamp from custom properties if available"""
         if not self.custom_properties:
             return None
-        
-        last_refresh = self.custom_properties.get('last_refresh')
+
+        last_refresh = self.custom_properties.get("last_refresh")
         if last_refresh:
             try:
                 from datetime import datetime
+
                 return datetime.fromisoformat(last_refresh)
             except (ValueError, TypeError):
                 pass
-        
+
         return None
 
 

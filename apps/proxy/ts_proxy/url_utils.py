@@ -431,6 +431,7 @@ def get_alternate_streams(channel_id: str, current_stream_id: Optional[int] = No
         logger.error(f"Error getting alternate streams for channel {channel_id}: {e}", exc_info=True)
         return []
 
+
 def validate_stream_url(url, user_agent=None, timeout=(5, 5)):
     """
     Validate if a stream URL is accessible without downloading the full content.
