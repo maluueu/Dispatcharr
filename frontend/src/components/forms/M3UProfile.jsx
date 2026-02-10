@@ -15,6 +15,8 @@ import {
   Grid,
   Textarea,
   NumberInput,
+  Switch,
+  Tooltip,
 } from '@mantine/core';
 import { useWebSocket } from '../../WebSocket';
 import usePlaylistsStore from '../../store/playlists';
@@ -36,6 +38,7 @@ const RegexFormAndView = ({ profile = null, m3u, isOpen, onClose }) => {
     () => ({
       name: profile?.name || '',
       max_streams: profile?.max_streams || 0,
+      is_backup_only: profile?.is_backup_only || false,
       search_pattern: profile?.search_pattern || '',
       replace_pattern: profile?.replace_pattern || '',
       notes: profile?.custom_properties?.notes || '',
@@ -45,6 +48,7 @@ const RegexFormAndView = ({ profile = null, m3u, isOpen, onClose }) => {
 
   const schema = Yup.object({
     name: Yup.string().required('Name is required'),
+    is_backup_only: Yup.boolean(),
     search_pattern: Yup.string().when([], {
       is: () => !isDefaultProfile,
       then: (schema) => schema.required('Search pattern is required'),
@@ -70,6 +74,8 @@ const RegexFormAndView = ({ profile = null, m3u, isOpen, onClose }) => {
     resolver: yupResolver(schema),
   });
 
+  const isBackupOnly = watch('is_backup_only');
+
   const onSubmit = async (values) => {
     console.log('submiting');
 
@@ -89,6 +95,7 @@ const RegexFormAndView = ({ profile = null, m3u, isOpen, onClose }) => {
       submitValues = {
         name: values.name,
         max_streams: values.max_streams,
+        is_backup_only: values.is_backup_only,
         search_pattern: values.search_pattern,
         replace_pattern: values.replace_pattern,
         custom_properties: {
@@ -255,6 +262,28 @@ const RegexFormAndView = ({ profile = null, m3u, isOpen, onClose }) => {
               error={errors.replace_pattern?.message}
             />
           </>
+        )}
+
+        {/* Backup-only toggle — only for non-default profiles */}
+        {!isDefaultProfile && (
+          <Tooltip
+            label="When enabled, this profile will only be used when the primary profile's URL fails DNS resolution. Useful for providing a failover server."
+            multiline
+            w={300}
+            withArrow
+            position="top-start"
+          >
+            <Switch
+              label="Backup Only (DNS Failover)"
+              description="Only use this profile when the primary URL's DNS fails"
+              checked={isBackupOnly}
+              onChange={(event) =>
+                setValue('is_backup_only', event.currentTarget.checked)
+              }
+              mt="md"
+              mb="md"
+            />
+          </Tooltip>
         )}
 
         <Textarea
