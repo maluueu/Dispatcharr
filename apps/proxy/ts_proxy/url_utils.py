@@ -2,22 +2,20 @@
 Utilities for handling stream URLs and transformations.
 """
 
+import logging
 import re
 import socket
-from typing import List, Optional, Tuple
 from urllib.parse import urlparse
-
-import requests
+from typing import Optional, Tuple, List
 from django.shortcuts import get_object_or_404
-
 from apps.channels.models import Channel, Stream
 from apps.m3u.models import M3UAccount, M3UAccountProfile
-from core.models import CoreSettings, StreamProfile, UserAgent
-
+from core.models import UserAgent, CoreSettings, StreamProfile
 from .utils import get_logger
+from uuid import UUID
+import requests
 
 logger = get_logger()
-
 
 # ---------------------------------------------------------------------------
 # DNS resolution helper
@@ -208,12 +206,6 @@ def _try_backup_profiles_for_dns(stream, m3u_account, redis_client, channel=None
     )
     return None, None
 
-
-# ---------------------------------------------------------------------------
-# Public helpers
-# ---------------------------------------------------------------------------
-
-
 def get_stream_object(id: str):
     try:
         logger.info(f"Fetching channel ID {id}")
@@ -222,7 +214,6 @@ def get_stream_object(id: str):
         # UUID check failed, assume stream hash
         logger.info(f"Fetching stream hash {id}")
         return get_object_or_404(Stream, stream_hash=id)
-
 
 def generate_stream_url(channel_id: str) -> Tuple[str, str, bool, Optional[int]]:
     """
@@ -252,22 +243,14 @@ def generate_stream_url(channel_id: str) -> Tuple[str, str, bool, Optional[int]]
 
             # Get active profiles for this M3U account
             m3u_profiles = m3u_account.profiles.filter(is_active=True)
-            default_profile = next(
-                (obj for obj in m3u_profiles if obj.is_default), None
-            )
+            default_profile = next((obj for obj in m3u_profiles if obj.is_default), None)
 
             if not default_profile:
-                logger.error(
-                    f"No default active profile found for M3U account {m3u_account.id}"
-                )
+                logger.error(f"No default active profile found for M3U account {m3u_account.id}")
                 return None, None, False, None
 
-            # Normal profiles: default first, then non-default non-backup
-            profiles = [default_profile] + [
-                obj
-                for obj in m3u_profiles
-                if not obj.is_default and not obj.is_backup_only
-            ]
+            # Check profiles in order: default first, then others
+            profiles = [default_profile] + [obj for obj in m3u_profiles if not obj.is_default and not obj.is_backup_only]
 
             # Try to find an available profile with connection capacity
             redis_client = RedisClient.get_client()
@@ -279,51 +262,32 @@ def generate_stream_url(channel_id: str) -> Tuple[str, str, bool, Optional[int]]
                 # Check connection availability
                 if redis_client:
                     profile_connections_key = f"profile_connections:{profile.id}"
-                    current_connections = int(
-                        redis_client.get(profile_connections_key) or 0
-                    )
+                    current_connections = int(redis_client.get(profile_connections_key) or 0)
 
                     # Check if profile has available slots (or unlimited connections)
-                    if (
-                        profile.max_streams == 0
-                        or current_connections < profile.max_streams
-                    ):
+                    if profile.max_streams == 0 or current_connections < profile.max_streams:
                         selected_profile = profile
-                        logger.debug(
-                            f"Selected profile {profile.id} with {current_connections}/{profile.max_streams} connections for stream preview"
-                        )
+                        logger.debug(f"Selected profile {profile.id} with {current_connections}/{profile.max_streams} connections for stream preview")
                         break
                     else:
-                        logger.debug(
-                            f"Profile {profile.id} at max connections: {current_connections}/{profile.max_streams}"
-                        )
+                        logger.debug(f"Profile {profile.id} at max connections: {current_connections}/{profile.max_streams}")
                 else:
                     # No Redis available, use first active profile
                     selected_profile = profile
                     break
 
             if not selected_profile:
-                logger.error(
-                    f"No profiles available with connection capacity for M3U account {m3u_account.id}"
-                )
+                logger.error(f"No profiles available with connection capacity for M3U account {m3u_account.id}")
                 return None, None, False, None
 
             # Get the appropriate user agent
             stream_user_agent = m3u_account.get_user_agent().user_agent
             if stream_user_agent is None:
-                stream_user_agent = UserAgent.objects.get(
-                    id=CoreSettings.get_default_user_agent_id()
-                )
-                logger.debug(
-                    f"No user agent found for account, using default: {stream_user_agent}"
-                )
+                stream_user_agent = UserAgent.objects.get(id=CoreSettings.get_default_user_agent_id())
+                logger.debug(f"No user agent found for account, using default: {stream_user_agent}")
 
             # Get stream URL with the selected profile's URL transformation
-            stream_url = transform_url(
-                stream.url,
-                selected_profile.search_pattern,
-                selected_profile.replace_pattern,
-            )
+            stream_url = transform_url(stream.url, selected_profile.search_pattern, selected_profile.replace_pattern)
 
             # --- DNS check with backup-only fallback ---
             if not check_url_dns(stream_url):
@@ -346,9 +310,7 @@ def generate_stream_url(channel_id: str) -> Tuple[str, str, bool, Optional[int]]
             # Check if the stream has its own stream_profile set, otherwise use default
             if stream.stream_profile:
                 stream_profile = stream.stream_profile
-                logger.debug(
-                    f"Using stream's own stream profile: {stream_profile.name}"
-                )
+                logger.debug(f"Using stream's own stream profile: {stream_profile.name}")
             else:
                 stream_profile = StreamProfile.objects.get(
                     id=CoreSettings.get_default_stream_profile_id()
@@ -373,9 +335,7 @@ def generate_stream_url(channel_id: str) -> Tuple[str, str, bool, Optional[int]]
         stream_id, profile_id, error_reason = channel.get_stream()
 
         if not stream_id or not profile_id:
-            logger.error(
-                f"No stream available for channel {channel_id}: {error_reason}"
-            )
+            logger.error(f"No stream available for channel {channel_id}: {error_reason}")
             return None, None, False, None
 
         # Look up the Stream and Profile objects
@@ -394,30 +354,21 @@ def generate_stream_url(channel_id: str) -> Tuple[str, str, bool, Optional[int]]
         stream_user_agent = m3u_account.get_user_agent().user_agent
 
         if stream_user_agent is None:
-            stream_user_agent = UserAgent.objects.get(
-                id=CoreSettings.get_default_user_agent_id()
-            )
-            logger.debug(
-                f"No user agent found for account, using default: {stream_user_agent}"
-            )
+            stream_user_agent = UserAgent.objects.get(id=CoreSettings.get_default_user_agent_id())
+            logger.debug(f"No user agent found for account, using default: {stream_user_agent}")
 
         # Generate stream URL based on the selected profile
         input_url = stream.url
-        stream_url = transform_url(
-            input_url, m3u_profile.search_pattern, m3u_profile.replace_pattern
-        )
+        stream_url = transform_url(input_url, m3u_profile.search_pattern, m3u_profile.replace_pattern)
 
         # --- DNS check with backup-only fallback ---
         if not check_url_dns(stream_url):
-            from core.utils import RedisClient
-
-            redis_client = RedisClient.get_client()
             logger.warning(
-                f"DNS resolution failed for primary profile {m3u_profile.id} "
-                f"URL {stream_url}, trying backup-only profiles for channel {channel_id}"
+                f"DNS resolution failed for profile {m3u_profile.id} "
+                f"URL {stream_url}, trying backup-only profiles"
             )
             backup_profile, backup_url = _try_backup_profiles_for_dns(
-                stream, m3u_account, redis_client, channel=channel
+                stream, m3u_account, None, channel
             )
             if backup_profile:
                 m3u_profile = backup_profile
@@ -425,8 +376,7 @@ def generate_stream_url(channel_id: str) -> Tuple[str, str, bool, Optional[int]]
             else:
                 logger.error(
                     f"All profiles (including backups) failed DNS for "
-                    f"M3U account {m3u_account.id} on channel {channel_id}, "
-                    f"proceeding with original URL"
+                    f"M3U account {m3u_account.id}, proceeding with original URL"
                 )
 
         # Check if transcoding is needed
@@ -442,7 +392,6 @@ def generate_stream_url(channel_id: str) -> Tuple[str, str, bool, Optional[int]]
     except Exception as e:
         logger.error(f"Error generating stream URL: {e}")
         return None, None, False, None
-
 
 def transform_url(input_url: str, search_pattern: str, replace_pattern: str) -> str:
     """
@@ -462,7 +411,7 @@ def transform_url(input_url: str, search_pattern: str, replace_pattern: str) -> 
         logger.debug(f"  search: {search_pattern}")
 
         # Handle backreferences in the replacement pattern
-        safe_replace_pattern = re.sub(r"\$(\d+)", r"\\\1", replace_pattern)
+        safe_replace_pattern = re.sub(r'\$(\d+)', r'\\\1', replace_pattern)
         logger.debug(f"  replace: {replace_pattern}")
         logger.debug(f"  safe replace: {safe_replace_pattern}")
 
@@ -475,10 +424,7 @@ def transform_url(input_url: str, search_pattern: str, replace_pattern: str) -> 
         logger.error(f"Error transforming URL: {e}")
         return input_url  # Return original URL on error
 
-
-def get_stream_info_for_switch(
-    channel_id: str, target_stream_id: Optional[int] = None
-) -> dict:
+def get_stream_info_for_switch(channel_id: str, target_stream_id: Optional[int] = None) -> dict:
     """
     Get stream information for a channel switch, optionally to a specific stream ID.
 
@@ -505,60 +451,59 @@ def get_stream_info_for_switch(
             # Find compatible profile for this stream with connection availability check
             m3u_account = stream.m3u_account
             if not m3u_account:
-                return {"error": "Stream has no M3U account"}
+                return {'error': 'Stream has no M3U account'}
 
             m3u_profiles = m3u_account.profiles.filter(is_active=True)
-            default_profile = next(
-                (obj for obj in m3u_profiles if obj.is_default), None
-            )
+            default_profile = next((obj for obj in m3u_profiles if obj.is_default), None)
 
             if not default_profile:
-                return {"error": "M3U account has no default profile"}
+                return {'error': 'M3U account has no default profile'}
 
-            # Normal profiles: default first, then non-default non-backup
-            profiles = [default_profile] + [
-                obj
-                for obj in m3u_profiles
-                if not obj.is_default and not obj.is_backup_only
-            ]
+            # Check profiles in order: default first, then others
+            profiles = [default_profile] + [obj for obj in m3u_profiles if not obj.is_default and not obj.is_backup_only]
 
-            selected_profile = _select_profile_with_capacity(
-                profiles, redis_client, channel=channel
-            )
+            selected_profile = None
+            for profile in profiles:
 
-            # If a normal profile was selected, check DNS and possibly fall back
-            if selected_profile:
-                candidate_url = transform_url(
-                    stream.url,
-                    selected_profile.search_pattern,
-                    selected_profile.replace_pattern,
-                )
-                if not check_url_dns(candidate_url):
-                    logger.warning(
-                        f"DNS failed for profile {selected_profile.id} URL {candidate_url} "
-                        f"during stream switch for channel {channel_id}, trying backup profiles"
-                    )
-                    backup_profile, backup_url = _try_backup_profiles_for_dns(
-                        stream, m3u_account, redis_client, channel=channel
-                    )
-                    if backup_profile:
-                        selected_profile = backup_profile
+                # Check connection availability
+                if redis_client:
+                    profile_connections_key = f"profile_connections:{profile.id}"
+                    current_connections = int(redis_client.get(profile_connections_key) or 0)
+
+                    # Check if this channel is already using this profile
+                    channel_using_profile = False
+                    existing_stream_id = redis_client.get(f"channel_stream:{channel.id}")
+                    if existing_stream_id:
+                        # Decode bytes to string/int for proper Redis key lookup
+                        existing_stream_id = existing_stream_id.decode('utf-8')
+                        existing_profile_id = redis_client.get(f"stream_profile:{existing_stream_id}")
+                        if existing_profile_id and int(existing_profile_id.decode('utf-8')) == profile.id:
+                            channel_using_profile = True
+                            logger.debug(f"Channel {channel.id} already using profile {profile.id}")
+
+                    # Calculate effective connections (subtract 1 if channel already using this profile)
+                    effective_connections = current_connections - (1 if channel_using_profile else 0)
+
+                    # Check if profile has available slots
+                    if profile.max_streams == 0 or effective_connections < profile.max_streams:
+                        selected_profile = profile
+                        logger.debug(f"Selected profile {profile.id} with {effective_connections}/{profile.max_streams} effective connections (current: {current_connections}, already using: {channel_using_profile})")
+                        break
                     else:
-                        logger.error(
-                            f"All profiles (including backups) failed DNS during "
-                            f"stream switch for channel {channel_id}"
-                        )
-                        # Keep the original selected_profile – let the
-                        # stream manager deal with the connection error
+                        logger.debug(f"Profile {profile.id} at max connections: {effective_connections}/{profile.max_streams} (current: {current_connections}, already using: {channel_using_profile})")
+                else:
+                    # No Redis available, assume first active profile is okay
+                    selected_profile = profile
+                    break
 
             if not selected_profile:
-                return {"error": "No profiles available with connection capacity"}
+                return {'error': 'No profiles available with connection capacity'}
 
             m3u_profile_id = selected_profile.id
         else:
             stream_id, m3u_profile_id, error_reason = channel.get_stream()
             if stream_id is None or m3u_profile_id is None:
-                return {"error": error_reason or "No stream assigned to channel"}
+                return {'error': error_reason or 'No stream assigned to channel'}
 
         # Get the stream and profile objects directly
         stream = get_object_or_404(Stream, pk=stream_id)
@@ -566,35 +511,36 @@ def get_stream_info_for_switch(
 
         # Check connections left
         m3u_account = M3UAccount.objects.get(id=profile.m3u_account.id)
+        #connections_left = get_connections_left(m3u_profile_id)
+
+        #if connections_left <= 0:
+            #logger.warning(f"No connections left for M3U account {m3u_account.id}")
+            #return {'error': 'No connections left'}
 
         # Get the user agent from the M3U account
         user_agent = m3u_account.get_user_agent().user_agent
 
         # Generate URL using the transform function directly
-        stream_url = transform_url(
-            stream.url, profile.search_pattern, profile.replace_pattern
-        )
+        stream_url = transform_url(stream.url, profile.search_pattern, profile.replace_pattern)
 
-        # --- DNS check with backup-only fallback (for the non-target_stream_id path) ---
-        if not target_stream_id:
-            # The target_stream_id path already handled DNS above
-            if not check_url_dns(stream_url):
-                logger.warning(
-                    f"DNS failed for profile {profile.id} URL {stream_url} "
-                    f"during stream info fetch for channel {channel_id}, trying backup profiles"
+        # --- DNS check with backup-only fallback ---
+        if not check_url_dns(stream_url):
+            logger.warning(
+                f"DNS resolution failed for profile {profile.id} "
+                f"URL {stream_url}, trying backup-only profiles"
+            )
+            backup_profile, backup_url = _try_backup_profiles_for_dns(
+                stream, m3u_account, redis_client, channel
+            )
+            if backup_profile:
+                profile = backup_profile
+                m3u_profile_id = backup_profile.id
+                stream_url = backup_url
+            else:
+                logger.error(
+                    f"All profiles (including backups) failed DNS for "
+                    f"M3U account {m3u_account.id}, proceeding with original URL"
                 )
-                backup_profile, backup_url = _try_backup_profiles_for_dns(
-                    stream, m3u_account, redis_client, channel=channel
-                )
-                if backup_profile:
-                    profile = backup_profile
-                    m3u_profile_id = backup_profile.id
-                    stream_url = backup_url
-                else:
-                    logger.error(
-                        f"All profiles (including backups) failed DNS for "
-                        f"channel {channel_id}, proceeding with original URL"
-                    )
 
         # Get transcode info from the channel's stream profile
         stream_profile = channel.get_stream_profile()
@@ -602,21 +548,18 @@ def get_stream_info_for_switch(
         profile_value = stream_profile.id
 
         return {
-            "url": stream_url,
-            "user_agent": user_agent,
-            "transcode": transcode,
-            "stream_profile": profile_value,
-            "stream_id": stream_id,
-            "m3u_profile_id": m3u_profile_id,
+            'url': stream_url,
+            'user_agent': user_agent,
+            'transcode': transcode,
+            'stream_profile': profile_value,
+            'stream_id': stream_id,
+            'm3u_profile_id': m3u_profile_id
         }
     except Exception as e:
         logger.error(f"Error getting stream info for switch: {e}", exc_info=True)
-        return {"error": f"Error: {str(e)}"}
+        return {'error': f'Error: {str(e)}'}
 
-
-def get_alternate_streams(
-    channel_id: str, current_stream_id: Optional[int] = None
-) -> List[dict]:
+def get_alternate_streams(channel_id: str, current_stream_id: Optional[int] = None) -> List[dict]:
     """
     Get alternative streams for a channel when the current stream fails.
 
@@ -637,15 +580,11 @@ def get_alternate_streams(
             return []
 
         redis_client = RedisClient.get_client()
-        logger.debug(
-            f"Looking for alternate streams for channel {channel_id}, current stream ID: {current_stream_id}"
-        )
+        logger.debug(f"Looking for alternate streams for channel {channel_id}, current stream ID: {current_stream_id}")
 
         # Get all assigned streams for this channel using the correct ordering
-        streams = channel.streams.all().order_by("channelstream__order")
-        logger.debug(
-            f"Channel {channel_id} has {streams.count()} total assigned streams"
-        )
+        streams = channel.streams.all().order_by('channelstream__order')
+        logger.debug(f"Channel {channel_id} has {streams.count()} total assigned streams")
 
         if not streams.exists():
             logger.warning(f"No streams assigned to channel {channel_id}")
@@ -655,9 +594,7 @@ def get_alternate_streams(
 
         # Process each stream in the user-defined order
         for stream in streams:
-            logger.debug(
-                f"Checking stream ID {stream.id} ({stream.name}) for channel {channel_id}"
-            )
+            logger.debug(f"Checking stream ID {stream.id} ({stream.name}) for channel {channel_id}")
 
             # Skip the current failing stream
             if current_stream_id and stream.id == current_stream_id:
@@ -674,31 +611,53 @@ def get_alternate_streams(
                     logger.debug(f"M3U account {m3u_account.id} is inactive, skipping.")
                     continue
                 m3u_profiles = m3u_account.profiles.filter(is_active=True)
-                default_profile = next(
-                    (obj for obj in m3u_profiles if obj.is_default), None
-                )
+                default_profile = next((obj for obj in m3u_profiles if obj.is_default), None)
 
                 if not default_profile:
                     logger.debug(f"M3U account {m3u_account.id} has no default profile")
                     continue
 
-                # Normal profiles: default first, then non-default non-backup
-                profiles = [default_profile] + [
-                    obj
-                    for obj in m3u_profiles
-                    if not obj.is_default and not obj.is_backup_only
-                ]
+                # Check profiles in order with connection availability
+                profiles = [default_profile] + [obj for obj in m3u_profiles if not obj.is_default and not obj.is_backup_only]
 
-                selected_profile = _select_profile_with_capacity(
-                    profiles, redis_client, channel=channel
-                )
+                selected_profile = None
+                for profile in profiles:
+                    # Check connection availability
+                    if redis_client:
+                        profile_connections_key = f"profile_connections:{profile.id}"
+                        current_connections = int(redis_client.get(profile_connections_key) or 0)
 
-                # If we found a normal profile, verify DNS; fall back to backup if needed
+                        # Check if this channel is already using this profile
+                        channel_using_profile = False
+                        existing_stream_id = redis_client.get(f"channel_stream:{channel.id}")
+                        if existing_stream_id:
+                            # Decode bytes to string/int for proper Redis key lookup
+                            existing_stream_id = existing_stream_id.decode('utf-8')
+                            existing_profile_id = redis_client.get(f"stream_profile:{existing_stream_id}")
+                            if existing_profile_id and int(existing_profile_id.decode('utf-8')) == profile.id:
+                                channel_using_profile = True
+                                logger.debug(f"Channel {channel.id} already using profile {profile.id}")
+
+                        # Calculate effective connections (subtract 1 if channel already using this profile)
+                        effective_connections = current_connections - (1 if channel_using_profile else 0)
+
+                        # Check if profile has available slots
+                        if profile.max_streams == 0 or effective_connections < profile.max_streams:
+                            selected_profile = profile
+                            logger.debug(f"Found available profile {profile.id} for stream {stream.id}: {effective_connections}/{profile.max_streams} effective (current: {current_connections}, already using: {channel_using_profile})")
+                            break
+                        else:
+                            logger.debug(f"Profile {profile.id} at max connections: {effective_connections}/{profile.max_streams} (current: {current_connections}, already using: {channel_using_profile})")
+                    else:
+                        # No Redis available, assume first active profile is okay
+                        selected_profile = profile
+                        break
+
+
+                # DNS check: verify the selected profile URL resolves
                 if selected_profile:
                     candidate_url = transform_url(
-                        stream.url,
-                        selected_profile.search_pattern,
-                        selected_profile.replace_pattern,
+                        stream.url, selected_profile.search_pattern, selected_profile.replace_pattern
                     )
                     if not check_url_dns(candidate_url):
                         logger.warning(
@@ -711,47 +670,34 @@ def get_alternate_streams(
                         if backup_profile:
                             selected_profile = backup_profile
                         else:
-                            # All profiles fail DNS for this stream – skip it entirely
+                            # All profiles fail DNS for this stream - skip it
                             logger.debug(
                                 f"All profiles failed DNS for stream {stream.id}, skipping"
                             )
                             selected_profile = None
-
                 if selected_profile:
-                    alternate_streams.append(
-                        {
-                            "stream_id": stream.id,
-                            "profile_id": selected_profile.id,
-                            "name": stream.name,
-                        }
-                    )
+                    alternate_streams.append({
+                        'stream_id': stream.id,
+                        'profile_id': selected_profile.id,
+                        'name': stream.name
+                    })
                 else:
                     logger.debug(f"No available profiles for stream ID {stream.id}")
 
             except Exception as inner_e:
-                logger.error(
-                    f"Error finding profiles for stream {stream.id}: {inner_e}"
-                )
+                logger.error(f"Error finding profiles for stream {stream.id}: {inner_e}")
                 continue
 
         if alternate_streams:
-            stream_ids = ", ".join([str(s["stream_id"]) for s in alternate_streams])
-            logger.info(
-                f"Found {len(alternate_streams)} alternate streams with available connections for channel {channel_id}: [{stream_ids}]"
-            )
+            stream_ids = ', '.join([str(s['stream_id']) for s in alternate_streams])
+            logger.info(f"Found {len(alternate_streams)} alternate streams with available connections for channel {channel_id}: [{stream_ids}]")
         else:
-            logger.warning(
-                f"No alternate streams with available connections found for channel {channel_id}"
-            )
+            logger.warning(f"No alternate streams with available connections found for channel {channel_id}")
 
         return alternate_streams
     except Exception as e:
-        logger.error(
-            f"Error getting alternate streams for channel {channel_id}: {e}",
-            exc_info=True,
-        )
+        logger.error(f"Error getting alternate streams for channel {channel_id}: {e}", exc_info=True)
         return []
-
 
 def validate_stream_url(url, user_agent=None, timeout=(5, 5)):
     """
@@ -770,7 +716,7 @@ def validate_stream_url(url, user_agent=None, timeout=(5, 5)):
     """
     # Check if URL uses non-HTTP protocols (UDP/RTP/RTSP)
     # These cannot be validated via HTTP methods, so we skip validation
-    if url.startswith(("udp://", "rtp://", "rtsp://")):
+    if url.startswith(('udp://', 'rtp://', 'rtsp://')):
         logger.info(f"Skipping HTTP validation for non-HTTP protocol: {url}")
         return True, url, 200, "Non-HTTP protocol (UDP/RTP/RTSP) - validation skipped"
 
@@ -778,20 +724,22 @@ def validate_stream_url(url, user_agent=None, timeout=(5, 5)):
         # Create session with proper headers
         session = requests.Session()
         headers = {
-            "User-Agent": user_agent,
-            "Connection": "close",  # Don't keep connection alive
+            'User-Agent': user_agent,
+            'Connection': 'close'  # Don't keep connection alive
         }
         session.headers.update(headers)
 
         # Make HEAD request first as it's faster and doesn't download content
         head_request_success = True
         try:
-            head_response = session.head(url, timeout=timeout, allow_redirects=True)
+            head_response = session.head(
+                url,
+                timeout=timeout,
+                allow_redirects=True
+            )
         except requests.exceptions.RequestException as e:
             head_request_success = False
-            logger.warning(
-                f"Request error (HEAD), assuming HEAD not supported: {str(e)}"
-            )
+            logger.warning(f"Request error (HEAD), assuming HEAD not supported: {str(e)}")
 
         # If HEAD not supported, server will return 405 or other error
         if head_request_success and (200 <= head_response.status_code < 300):
@@ -800,24 +748,20 @@ def validate_stream_url(url, user_agent=None, timeout=(5, 5)):
 
         # Try a GET request with stream=True to avoid downloading all content
         get_response = session.get(
-            url, stream=True, timeout=timeout, allow_redirects=True
+            url,
+            stream=True,
+            timeout=timeout,
+            allow_redirects=True
         )
 
         # IMPORTANT: Check status code first before checking content
         if not (200 <= get_response.status_code < 300):
-            logger.warning(
-                f"Stream validation failed with HTTP status {get_response.status_code}"
-            )
-            return (
-                False,
-                url,
-                get_response.status_code,
-                f"Invalid HTTP status: {get_response.status_code}",
-            )
+            logger.warning(f"Stream validation failed with HTTP status {get_response.status_code}")
+            return False, url, get_response.status_code, f"Invalid HTTP status: {get_response.status_code}"
 
         # Only check content if status code is valid
         try:
-            chunk = next(get_response.iter_content(chunk_size=188 * 10))
+            chunk = next(get_response.iter_content(chunk_size=188*10))
             is_valid = len(chunk) > 0
             message = f"Valid (GET request, received {len(chunk)} bytes)"
         except StopIteration:
@@ -825,35 +769,33 @@ def validate_stream_url(url, user_agent=None, timeout=(5, 5)):
             message = "Empty response from server"
 
         # Check content type for additional validation
-        content_type = get_response.headers.get("Content-Type", "").lower()
+        content_type = get_response.headers.get('Content-Type', '').lower()
 
         # Expanded list of valid content types for streaming media
         valid_content_types = [
-            "video/",
-            "audio/",
-            "mpegurl",
-            "octet-stream",
-            "mp2t",
-            "mp4",
-            "mpeg",
-            "dash+xml",
-            "application/mp4",
-            "application/mpeg",
-            "application/x-mpegurl",
-            "application/vnd.apple.mpegurl",
-            "application/ogg",
-            "m3u",
-            "playlist",
-            "binary/",
-            "rtsp",
-            "rtmp",
-            "hls",
-            "ts",
+            'video/',
+            'audio/',
+            'mpegurl',
+            'octet-stream',
+            'mp2t',
+            'mp4',
+            'mpeg',
+            'dash+xml',
+            'application/mp4',
+            'application/mpeg',
+            'application/x-mpegurl',
+            'application/vnd.apple.mpegurl',
+            'application/ogg',
+            'm3u',
+            'playlist',
+            'binary/',
+            'rtsp',
+            'rtmp',
+            'hls',
+            'ts'
         ]
 
-        content_type_valid = any(
-            type_str in content_type for type_str in valid_content_types
-        )
+        content_type_valid = any(type_str in content_type for type_str in valid_content_types)
 
         # Always consider the stream valid if we got data, regardless of content type
         # But add content type info to the message for debugging
@@ -880,9 +822,8 @@ def validate_stream_url(url, user_agent=None, timeout=(5, 5)):
     except Exception as e:
         return False, url, 0, f"Validation error: {str(e)}"
     finally:
-        if "session" in locals():
+        if 'session' in locals():
             session.close()
-
 
 def get_connections_left(m3u_profile_id: int) -> int:
     """
@@ -917,9 +858,7 @@ def get_connections_left(m3u_profile_id: int) -> int:
         # Calculate available connections
         connections_left = max(0, m3u_profile.max_streams - current_connections)
 
-        logger.debug(
-            f"M3U profile {m3u_profile_id}: {current_connections}/{m3u_profile.max_streams} used, {connections_left} available"
-        )
+        logger.debug(f"M3U profile {m3u_profile_id}: {current_connections}/{m3u_profile.max_streams} used, {connections_left} available")
 
         return connections_left
 
@@ -927,7 +866,5 @@ def get_connections_left(m3u_profile_id: int) -> int:
         logger.error(f"M3U profile {m3u_profile_id} not found")
         return 0
     except Exception as e:
-        logger.error(
-            f"Error getting connections left for M3U profile {m3u_profile_id}: {e}"
-        )
+        logger.error(f"Error getting connections left for M3U profile {m3u_profile_id}: {e}")
         return 0
