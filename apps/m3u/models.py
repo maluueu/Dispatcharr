@@ -256,6 +256,10 @@ class M3UAccountProfile(models.Model):
     is_active = models.BooleanField(
         default=True, help_text="Set to false to deactivate this profile"
     )
+    is_backup_only = models.BooleanField(
+        default=False,
+        help_text="Only use this profile as failover when the primary connection fails. Not used during normal stream selection.",
+    )
     search_pattern = models.CharField(
         max_length=255,
     )

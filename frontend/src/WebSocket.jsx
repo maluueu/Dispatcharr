@@ -971,9 +971,20 @@ export const WebsocketProvider = ({ children }) => {
   const fetchLogos = useLogosStore((s) => s.fetchAllLogos);
   const fetchChannelProfiles = useChannelsStore((s) => s.fetchChannelProfiles);
 
+  const sendMessage = useCallback((...args) => {
+    if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+      ws.current.send(...args);
+    } else {
+      console.warn(
+        'WebSocket send skipped — readyState:',
+        ws.current?.readyState
+      );
+    }
+  }, []);
+
   const ret = useMemo(() => {
-    return [isReady, ws.current?.send.bind(ws.current), val];
-  }, [isReady, val]);
+    return [isReady, sendMessage, val];
+  }, [isReady, sendMessage, val]);
 
   return (
     <WebsocketContext.Provider value={ret}>

@@ -21,8 +21,9 @@ import {
   Switch,
   Badge,
   Stack,
+  Tooltip,
 } from '@mantine/core';
-import { SquareMinus, SquarePen, Info } from 'lucide-react';
+import { SquareMinus, SquarePen, Info, ShieldAlert } from 'lucide-react';
 
 const M3UProfiles = ({ playlist = null, isOpen, onClose }) => {
   const theme = useMantineTheme();
@@ -224,7 +225,24 @@ const M3UProfiles = ({ playlist = null, isOpen, onClose }) => {
                   <Group justify="space-between" align="center">
                     <Group spacing="sm" align="center">
                       <Stack spacing={2}>
-                        <Text fw={600}>{item.name}</Text>
+                        <Group spacing="xs" align="center">
+                          <Text fw={600}>{item.name}</Text>
+                          {item.is_backup_only && (
+                            <Tooltip
+                              label="Backup Only — used when primary connection fails"
+                              withArrow
+                            >
+                              <Badge
+                                size="sm"
+                                color="orange"
+                                variant="light"
+                                leftSection={<ShieldAlert size={12} />}
+                              >
+                                Backup
+                              </Badge>
+                            </Tooltip>
+                          )}
+                        </Group>
                         {/* Show notes if they exist */}
                         {item.custom_properties?.notes && (
                           <Text

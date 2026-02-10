@@ -22,7 +22,7 @@ from .utils import detect_stream_type, get_logger
 from .redis_keys import RedisKeys
 from .constants import ChannelState, EventType, StreamType, ChannelMetadataField, TS_PACKET_SIZE
 from .config_helper import ConfigHelper
-from .url_utils import get_alternate_streams, get_stream_info_for_switch, get_stream_object
+from .url_utils import get_alternate_streams, get_backup_profile_url, get_stream_info_for_switch, get_stream_object
 
 logger = get_logger()
 
@@ -122,6 +122,9 @@ class StreamManager:
 
         # Add HTTP reader thread property
         self.http_reader = None
+
+        # Backup-only profile failover: only try once per stream
+        self._backup_tried = False
 
     def _create_session(self):
         """Create and configure requests session with optimal settings"""
@@ -300,6 +303,13 @@ class StreamManager:
                             # Normal shutdown requested
                             return
 
+
+                        # If connection never established, try backup-only profile
+                        if not connection_result and not self._backup_tried:
+                            backup_result = self._try_backup_profile()
+                            if backup_result:
+                                self.retry_count = 0
+                                break  # break inner retry loop; outer loop re-enters
                         # Connection failed, increment retry count
                         self.retry_count += 1
                         self.connected = False
@@ -330,6 +340,13 @@ class StreamManager:
 
                     except Exception as e:
                         logger.error(f"Connection error on channel: {self.channel_id}: {e}", exc_info=True)
+
+                        # Connection exception — try backup-only profile
+                        if not self._backup_tried:
+                            backup_result = self._try_backup_profile()
+                            if backup_result:
+                                self.retry_count = 0
+                                continue  # retry with backup URL
                         self.retry_count += 1
                         self.connected = False
 
@@ -1098,6 +1115,9 @@ class StreamManager:
                 self.tried_stream_ids.add(stream_id)
                 logger.info(f"Updated stream ID from {old_stream_id} to {stream_id} for channel {self.channel_id}")
 
+                # Reset backup flag for the new stream
+                self._backup_tried = False
+
             # Reset retry counter to allow immediate reconnect
             self.retry_count = 0
 
@@ -1654,6 +1674,10 @@ class StreamManager:
                 self.user_agent = new_user_agent
                 self.transcode = new_transcode
 
+
+                # Reset backup flag so backup-only profiles can be
+                # attempted for this new stream if needed.
+                self._backup_tried = False
                 # Update stream metadata in Redis - use the profile_id we got from get_alternate_streams
                 if hasattr(self.buffer, 'redis_client') and self.buffer.redis_client:
                     metadata_key = RedisKeys.channel_metadata(self.channel_id)
@@ -1680,6 +1704,117 @@ class StreamManager:
         except Exception as e:
             logger.error(f"Error trying next stream for channel {self.channel_id}: {e}", exc_info=True)
             return False
+
+
+    def _try_backup_profile(self):
+        """
+        Attempt to switch to a backup-only profile after a connection failure
+        on the current stream URL.
+
+        Called reactively after the real connection attempt (HTTP or transcode)
+        has failed. Only tried once per stream.
+
+        Returns:
+            bool: True if successfully switched to a backup profile URL.
+        """
+        if self._backup_tried:
+            return False
+
+        self._backup_tried = True  # Only try once per stream
+
+        if not self.current_stream_id:
+            logger.debug(f"No stream ID available for backup profile lookup on channel {self.channel_id}")
+            return False
+
+        logger.info(
+            f"Connection failure for channel {self.channel_id} stream {self.current_stream_id}, "
+            f"attempting backup-only profile lookup")
+
+        backup_info = get_backup_profile_url(self.current_stream_id, self.channel_id)
+        if not backup_info:
+            logger.warning(
+                f"No backup-only profiles available for stream {self.current_stream_id} "
+                f"on channel {self.channel_id}")
+            return False
+
+        new_url = backup_info["url"]
+        new_user_agent = backup_info.get("user_agent", self.user_agent)
+        backup_profile_id = backup_info["profile_id"]
+
+        logger.info(
+            f"Switching to backup profile {backup_profile_id} with URL {new_url} "
+            f"for channel {self.channel_id} (connection failure on primary)")
+
+        # Close existing connections before switching
+        if self.transcode or self.socket:
+            self._close_socket()
+        else:
+            self._close_connection()
+
+        # Update the URL directly (not via update_url which checks for same URL)
+        self.url = new_url
+        self.user_agent = new_user_agent
+        self.connected = False
+
+        # Update Redis: swap profile connection counts and stream-profile mapping
+        if hasattr(self.buffer, 'redis_client') and self.buffer.redis_client:
+            try:
+                redis_client = self.buffer.redis_client
+                stream_id_str = str(self.current_stream_id)
+
+                # Decrement old profile's connection count
+                old_profile_id = redis_client.get(f"stream_profile:{stream_id_str}")
+                if old_profile_id:
+                    old_profile_id = (
+                        old_profile_id.decode("utf-8")
+                        if isinstance(old_profile_id, bytes)
+                        else str(old_profile_id)
+                    )
+                    old_conn_key = f"profile_connections:{old_profile_id}"
+                    current_count = int(redis_client.get(old_conn_key) or 0)
+                    if current_count > 0:
+                        redis_client.decr(old_conn_key)
+                        logger.debug(
+                            f"Decremented profile {old_profile_id} connections "
+                            f"({current_count} -> {current_count - 1})")
+
+                # Point stream at the backup profile
+                redis_client.set(f"stream_profile:{stream_id_str}", backup_profile_id)
+
+                # Increment backup profile's connection count
+                backup_conn_key = f"profile_connections:{backup_profile_id}"
+                redis_client.incr(backup_conn_key)
+                new_count = int(redis_client.get(backup_conn_key) or 0)
+                logger.debug(f"Incremented backup profile {backup_profile_id} connections to {new_count}")
+
+                # Update channel metadata
+                metadata_key = RedisKeys.channel_metadata(self.channel_id)
+                redis_client.hset(metadata_key, mapping={
+                    ChannelMetadataField.URL: new_url,
+                    ChannelMetadataField.USER_AGENT: new_user_agent,
+                    ChannelMetadataField.M3U_PROFILE: str(backup_profile_id),
+                    ChannelMetadataField.STREAM_SWITCH_TIME: str(time.time()),
+                    ChannelMetadataField.STREAM_SWITCH_REASON: "backup_failover",
+                })
+            except Exception as e:
+                logger.error(f"Failed to update Redis for backup profile switch: {e}")
+
+        # Log the event
+        try:
+            channel_obj = Channel.objects.get(uuid=self.channel_id)
+            log_system_event(
+                'stream_switch',
+                channel_id=self.channel_id,
+                channel_name=channel_obj.name,
+                new_url=new_url[:100] if new_url else None,
+                stream_id=self.current_stream_id,
+                reason="backup_failover",
+                backup_profile_id=backup_profile_id,
+            )
+        except Exception as e:
+            logger.error(f"Could not log backup profile switch event: {e}")
+
+        return True
 
     # Add a new helper method to safely reset the URL switching state
     def _reset_url_switching_state(self):

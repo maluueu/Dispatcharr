@@ -15,6 +15,138 @@ import requests
 
 logger = get_logger()
 
+
+def _select_profile_with_capacity(profiles, redis_client, channel=None):
+    """
+    Pick the first profile from *profiles* that has connection capacity.
+    """
+    for profile in profiles:
+        if redis_client:
+            profile_connections_key = f"profile_connections:{profile.id}"
+            current_connections = int(redis_client.get(profile_connections_key) or 0)
+
+            # Check if this channel is already using this profile
+            channel_using_profile = False
+            if channel is not None:
+                existing_stream_id = redis_client.get(f"channel_stream:{channel.id}")
+                if existing_stream_id:
+                    existing_stream_id = (
+                        existing_stream_id.decode("utf-8")
+                        if isinstance(existing_stream_id, bytes)
+                        else str(existing_stream_id)
+                    )
+                    existing_profile_id = redis_client.get(
+                        f"stream_profile:{existing_stream_id}"
+                    )
+                    if existing_profile_id:
+                        existing_profile_id = (
+                            existing_profile_id.decode("utf-8")
+                            if isinstance(existing_profile_id, bytes)
+                            else str(existing_profile_id)
+                        )
+                        if int(existing_profile_id) == profile.id:
+                            channel_using_profile = True
+                            logger.debug(f"Channel {channel.id} already using profile {profile.id}")
+
+                effective_connections = current_connections - (1 if channel_using_profile else 0)
+            else:
+                effective_connections = current_connections
+
+            if profile.max_streams == 0 or effective_connections < profile.max_streams:
+                logger.debug(
+                    f"Selected profile {profile.id} with {effective_connections}/{profile.max_streams} "
+                    f"effective connections (current: {current_connections})")
+                return profile
+            else:
+                logger.debug(
+                    f"Profile {profile.id} at max connections: "
+                    f"{effective_connections}/{profile.max_streams} (current: {current_connections})")
+        else:
+            return profile
+
+    return None
+
+
+def _try_backup_profiles(stream, m3u_account, redis_client, channel=None):
+    """
+    Find the first backup-only profile that has connection capacity and
+    return its transformed URL.
+
+    Called reactively after a connection failure on the primary profile.
+    The caller validates reachability by actually connecting to the backup URL.
+    """
+    backup_profiles = list(
+        m3u_account.profiles.filter(is_active=True, is_backup_only=True)
+    )
+    if not backup_profiles:
+        logger.debug(f"No backup-only profiles available for M3U account {m3u_account.id}")
+        return None, None
+
+    logger.info(
+        f"Trying {len(backup_profiles)} backup-only profile(s) for M3U account "
+        f"{m3u_account.id} after connection failure on primary profile")
+
+    for profile in backup_profiles:
+        selected = _select_profile_with_capacity([profile], redis_client, channel=channel)
+        if not selected:
+            logger.debug(f"Backup profile {profile.id} has no capacity, skipping")
+            continue
+
+        backup_url = transform_url(stream.url, profile.search_pattern, profile.replace_pattern)
+        logger.info(
+            f"Selected backup profile {profile.id} with URL {backup_url} "
+            f"(M3U account {m3u_account.id})")
+        return profile, backup_url
+
+    logger.warning(f"No backup-only profiles with capacity for M3U account {m3u_account.id}")
+    return None, None
+
+
+def get_backup_profile_url(stream_id, channel_id=None):
+    """
+    Public helper for the StreamManager to call reactively when a
+    connection failure has been detected on the current stream URL.
+
+    Looks up the stream's M3U account, finds the first backup-only profile
+    with connection capacity, and returns the transformed URL plus metadata.
+    """
+    try:
+        from core.utils import RedisClient
+
+        stream = Stream.objects.get(pk=stream_id)
+        m3u_account = stream.m3u_account
+        if not m3u_account:
+            logger.debug(f"Stream {stream_id} has no M3U account, cannot find backup")
+            return None
+
+        redis_client = RedisClient.get_client()
+
+        channel = None
+        if channel_id:
+            try:
+                channel = Channel.objects.get(uuid=channel_id)
+            except Channel.DoesNotExist:
+                pass
+
+        profile, backup_url = _try_backup_profiles(stream, m3u_account, redis_client, channel=channel)
+        if not profile:
+            return None
+
+        user_agent = m3u_account.get_user_agent().user_agent
+
+        return {
+            "url": backup_url,
+            "user_agent": user_agent,
+            "profile_id": profile.id,
+            "stream_id": stream_id,
+        }
+    except Stream.DoesNotExist:
+        logger.error(f"Stream {stream_id} not found when looking for backup profile")
+        return None
+    except Exception as exc:
+        logger.error(f"Error getting backup profile URL for stream {stream_id}: {exc}", exc_info=True)
+        return None
+
 def get_stream_object(id: str):
     try:
         logger.info(f"Fetching channel ID {id}")
@@ -59,7 +191,7 @@ def generate_stream_url(channel_id: str) -> Tuple[str, str, bool, Optional[int]]
                 return None, None, False, None
 
             # Check profiles in order: default first, then others
-            profiles = [default_profile] + [obj for obj in m3u_profiles if not obj.is_default]
+            profiles = [default_profile] + [obj for obj in m3u_profiles if not obj.is_default and not obj.is_backup_only]
 
             # Try to find an available profile with connection capacity
             redis_client = RedisClient.get_client()
@@ -233,7 +365,7 @@ def get_stream_info_for_switch(channel_id: str, target_stream_id: Optional[int] 
                 return {'error': 'M3U account has no default profile'}
 
             # Check profiles in order: default first, then others
-            profiles = [default_profile] + [obj for obj in m3u_profiles if not obj.is_default]
+            profiles = [default_profile] + [obj for obj in m3u_profiles if not obj.is_default and not obj.is_backup_only]
 
             selected_profile = None
             for profile in profiles:
@@ -372,7 +504,7 @@ def get_alternate_streams(channel_id: str, current_stream_id: Optional[int] = No
                     continue
 
                 # Check profiles in order with connection availability
-                profiles = [default_profile] + [obj for obj in m3u_profiles if not obj.is_default]
+                profiles = [default_profile] + [obj for obj in m3u_profiles if not obj.is_default and not obj.is_backup_only]
 
                 selected_profile = None
                 for profile in profiles:

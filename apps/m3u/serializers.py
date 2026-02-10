@@ -48,6 +48,7 @@ class M3UAccountProfileSerializer(serializers.ModelSerializer):
             "max_streams",
             "is_active",
             "is_default",
+            "is_backup_only",
             "current_viewers",
             "search_pattern",
             "replace_pattern",
@@ -70,6 +71,21 @@ class M3UAccountProfileSerializer(serializers.ModelSerializer):
 
     def validate(self, data):
         """Custom validation to handle default profiles"""
+        # Prevent marking default profiles as backup-only
+        is_default = data.get("is_default", getattr(self.instance, "is_default", False))
+        is_backup_only = data.get(
+            "is_backup_only", getattr(self.instance, "is_backup_only", False)
+        )
+
+        if is_default and is_backup_only:
+            raise serializers.ValidationError(
+                {
+                    "is_backup_only": [
+                        "Default profiles cannot be marked as backup-only."
+                    ]
+                }
+            )
+
         # For updates to existing instances
         if self.instance and self.instance.is_default:
             # For default profiles, search_pattern and replace_pattern are not required
@@ -100,6 +116,10 @@ class M3UAccountProfileSerializer(serializers.ModelSerializer):
                     f"Default profiles can only modify name and notes. "
                     f"Cannot modify: {', '.join(disallowed_fields)}"
                 )
+
+        else:
+            # For non-default profiles, allow is_backup_only updates
+            pass
 
         return super().update(instance, validated_data)
 
