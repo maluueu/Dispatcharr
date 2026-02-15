@@ -1,35 +1,60 @@
 """Stream connection management for TS proxy"""
 
-import threading
 import logging
-import time
-import socket
-import requests
-import subprocess
-import gevent
 import re
-from typing import Optional, List
+import socket
+import subprocess
+import threading
+import time
+from typing import List, Optional
+
+import gevent
+import requests
 from django.db import connection
 from django.shortcuts import get_object_or_404
 from urllib3.exceptions import ReadTimeoutError
-from apps.proxy.config import TSConfig as Config
+
 from apps.channels.models import Channel, Stream
 from apps.m3u.models import M3UAccount, M3UAccountProfile
-from core.models import UserAgent, CoreSettings
+from apps.proxy.config import TSConfig as Config
+from core.models import CoreSettings, UserAgent
 from core.utils import log_system_event
-from .stream_buffer import StreamBuffer
-from .utils import detect_stream_type, get_logger
-from .redis_keys import RedisKeys
-from .constants import ChannelState, EventType, StreamType, ChannelMetadataField, TS_PACKET_SIZE
+
 from .config_helper import ConfigHelper
-from .url_utils import get_alternate_streams, get_stream_info_for_switch, get_stream_object
+from .constants import (
+    TS_PACKET_SIZE,
+    ChannelMetadataField,
+    ChannelState,
+    EventType,
+    StreamType,
+)
+from .http_streamer import is_dns_error_in_text
+from .redis_keys import RedisKeys
+from .stream_buffer import StreamBuffer
+from .url_utils import (
+    get_alternate_streams,
+    get_backup_profile_url,
+    get_stream_info_for_switch,
+    get_stream_object,
+)
+from .utils import detect_stream_type, get_logger
 
 logger = get_logger()
+
 
 class StreamManager:
     """Manages a connection to a TS stream without using raw sockets"""
 
-    def __init__(self, channel_id, url, buffer, user_agent=None, transcode=False, stream_id=None, worker_id=None):
+    def __init__(
+        self,
+        channel_id,
+        url,
+        buffer,
+        user_agent=None,
+        transcode=False,
+        stream_id=None,
+        worker_id=None,
+    ):
         # Basic properties
         self.channel_id = channel_id
         self.url = url
@@ -61,7 +86,7 @@ class StreamManager:
         # Stream health monitoring
         self.last_data_time = time.time()
         self.healthy = True
-        self.health_check_interval = ConfigHelper.get('HEALTH_CHECK_INTERVAL', 5)
+        self.health_check_interval = ConfigHelper.get("HEALTH_CHECK_INTERVAL", 5)
         self.chunk_size = ConfigHelper.chunk_size()
 
         # Add to your __init__ method
@@ -75,32 +100,44 @@ class StreamManager:
         # IMPROVED LOGGING: Better handle and track stream ID
         if stream_id:
             self.tried_stream_ids.add(stream_id)
-            logger.info(f"Initialized stream manager for channel {buffer.channel_id} with stream ID {stream_id}")
+            logger.info(
+                f"Initialized stream manager for channel {buffer.channel_id} with stream ID {stream_id}"
+            )
         else:
             # Try to get stream ID from Redis metadata if available
-            if hasattr(buffer, 'redis_client') and buffer.redis_client:
+            if hasattr(buffer, "redis_client") and buffer.redis_client:
                 try:
                     metadata_key = RedisKeys.channel_metadata(channel_id)
 
                     # Log all metadata for debugging purposes
                     metadata = buffer.redis_client.hgetall(metadata_key)
                     if metadata:
-                        logger.debug(f"Redis metadata for channel {channel_id}: {metadata}")
+                        logger.debug(
+                            f"Redis metadata for channel {channel_id}: {metadata}"
+                        )
 
                     # Try to get stream_id specifically
-                    stream_id_bytes = buffer.redis_client.hget(metadata_key, "stream_id")
+                    stream_id_bytes = buffer.redis_client.hget(
+                        metadata_key, "stream_id"
+                    )
                     if stream_id_bytes:
-                        self.current_stream_id = int(stream_id_bytes.decode('utf-8'))
+                        self.current_stream_id = int(stream_id_bytes.decode("utf-8"))
                         self.tried_stream_ids.add(self.current_stream_id)
-                        logger.info(f"Loaded stream ID {self.current_stream_id} from Redis for channel {buffer.channel_id}")
+                        logger.info(
+                            f"Loaded stream ID {self.current_stream_id} from Redis for channel {buffer.channel_id}"
+                        )
                     else:
-                        logger.warning(f"No stream_id found in Redis for channel {channel_id}. "
-                                     f"Stream switching will rely on URL comparison to avoid selecting the same stream.")
+                        logger.warning(
+                            f"No stream_id found in Redis for channel {channel_id}. "
+                            f"Stream switching will rely on URL comparison to avoid selecting the same stream."
+                        )
                 except Exception as e:
                     logger.warning(f"Error loading stream ID from Redis: {e}")
             else:
-                logger.warning(f"Unable to get stream ID for channel {channel_id}. "
-                             f"Stream switching will rely on URL comparison to avoid selecting the same stream.")
+                logger.warning(
+                    f"Unable to get stream ID for channel {channel_id}. "
+                    f"Stream switching will rely on URL comparison to avoid selecting the same stream."
+                )
 
         logger.info(f"Initialized stream manager for channel {buffer.channel_id}")
 
@@ -123,27 +160,30 @@ class StreamManager:
         # Add HTTP reader thread property
         self.http_reader = None
 
+        # DNS-failure reactive detection flags
+        self.dns_failure_detected = False
+        self._backup_tried = False  # Prevent repeated backup attempts per stream
+
     def _create_session(self):
         """Create and configure requests session with optimal settings"""
         session = requests.Session()
 
         # Configure session headers
-        session.headers.update({
-            'User-Agent': self.user_agent,
-            'Connection': 'keep-alive'
-        })
+        session.headers.update(
+            {"User-Agent": self.user_agent, "Connection": "keep-alive"}
+        )
 
         # Set up connection pooling for better performance
         adapter = requests.adapters.HTTPAdapter(
-            pool_connections=1,     # Single connection for this stream
-            pool_maxsize=1,         # Max size of connection pool
-            max_retries=3,          # Auto-retry for failed requests
-            pool_block=False        # Don't block when pool is full
+            pool_connections=1,  # Single connection for this stream
+            pool_maxsize=1,  # Max size of connection pool
+            max_retries=3,  # Auto-retry for failed requests
+            pool_block=False,  # Don't block when pool is full
         )
 
         # Apply adapter to both HTTP and HTTPS
-        session.mount('http://', adapter)
-        session.mount('https://', adapter)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
 
         return session
 
@@ -154,19 +194,25 @@ class StreamManager:
         while time.time() - start_time < timeout:
             # Check if transcode process is still running
             if self.transcode_process and self.transcode_process.poll() is None:
-                logger.debug(f"Waiting for existing transcode process to terminate for channel {self.channel_id}")
+                logger.debug(
+                    f"Waiting for existing transcode process to terminate for channel {self.channel_id}"
+                )
                 gevent.sleep(0.1)
                 continue
 
             # Check if HTTP connections are still active
             if self.current_response or self.current_session:
-                logger.debug(f"Waiting for existing HTTP connections to close for channel {self.channel_id}")
+                logger.debug(
+                    f"Waiting for existing HTTP connections to close for channel {self.channel_id}"
+                )
                 gevent.sleep(0.1)
                 continue
 
             # Check if socket is still active
             if self.socket:
-                logger.debug(f"Waiting for existing socket to close for channel {self.channel_id}")
+                logger.debug(
+                    f"Waiting for existing socket to close for channel {self.channel_id}"
+                )
                 gevent.sleep(0.1)
                 continue
 
@@ -175,7 +221,9 @@ class StreamManager:
             return True
 
         # Timeout reached
-        logger.warning(f"Timeout waiting for existing processes to close for channel {self.channel_id} after {timeout}s")
+        logger.warning(
+            f"Timeout waiting for existing processes to close for channel {self.channel_id} after {timeout}s"
+        )
         return False
 
     def run(self):
@@ -185,58 +233,100 @@ class StreamManager:
         # Add tracking for stream switching attempts
         stream_switch_attempts = 0
         # Get max stream switches from config using the helper method
-        max_stream_switches = ConfigHelper.max_stream_switches()  # Prevent infinite switching loops
+        max_stream_switches = (
+            ConfigHelper.max_stream_switches()
+        )  # Prevent infinite switching loops
 
         try:
-
-
             # Start health monitor thread
             health_thread = threading.Thread(target=self._monitor_health, daemon=True)
             health_thread.start()
 
-            logger.info(f"Starting stream for URL: {self.url} for channel {self.channel_id}")
+            logger.info(
+                f"Starting stream for URL: {self.url} for channel {self.channel_id}"
+            )
 
             # Main stream switching loop - we'll try different streams if needed
             while self.running and stream_switch_attempts <= max_stream_switches:
                 # Check for stuck switching state
-                if self.url_switching and time.time() - self.url_switch_start_time > self.url_switch_timeout:
-                    logger.warning(f"URL switching state appears stuck for channel {self.channel_id} "
-                                 f"({time.time() - self.url_switch_start_time:.1f}s > {self.url_switch_timeout}s timeout). "
-                                 f"Resetting switching state.")
+                if (
+                    self.url_switching
+                    and time.time() - self.url_switch_start_time
+                    > self.url_switch_timeout
+                ):
+                    logger.warning(
+                        f"URL switching state appears stuck for channel {self.channel_id} "
+                        f"({time.time() - self.url_switch_start_time:.1f}s > {self.url_switch_timeout}s timeout). "
+                        f"Resetting switching state."
+                    )
                     self._reset_url_switching_state()
 
                 # NEW: Check for health monitor recovery requests
-                if hasattr(self, 'needs_reconnect') and self.needs_reconnect and not self.url_switching:
-                    logger.info(f"Health monitor requested reconnect for channel {self.channel_id}")
+                if (
+                    hasattr(self, "needs_reconnect")
+                    and self.needs_reconnect
+                    and not self.url_switching
+                ):
+                    logger.info(
+                        f"Health monitor requested reconnect for channel {self.channel_id}"
+                    )
                     self.needs_reconnect = False
 
                     # Attempt reconnect without changing streams
                     if self._attempt_reconnect():
-                        logger.info(f"Health-requested reconnect successful for channel {self.channel_id}")
+                        logger.info(
+                            f"Health-requested reconnect successful for channel {self.channel_id}"
+                        )
                         continue  # Go back to main loop
                     else:
-                        logger.warning(f"Health-requested reconnect failed, will try stream switch for channel {self.channel_id}")
+                        logger.warning(
+                            f"Health-requested reconnect failed, will try stream switch for channel {self.channel_id}"
+                        )
                         self.needs_stream_switch = True
 
-                if hasattr(self, 'needs_stream_switch') and self.needs_stream_switch and not self.url_switching:
-                    logger.info(f"Health monitor requested stream switch for channel {self.channel_id}")
+                if (
+                    hasattr(self, "needs_stream_switch")
+                    and self.needs_stream_switch
+                    and not self.url_switching
+                ):
+                    logger.info(
+                        f"Health monitor requested stream switch for channel {self.channel_id}"
+                    )
                     self.needs_stream_switch = False
 
                     if self._try_next_stream():
-                        logger.info(f"Health-requested stream switch successful for channel {self.channel_id}")
+                        logger.info(
+                            f"Health-requested stream switch successful for channel {self.channel_id}"
+                        )
                         stream_switch_attempts += 1
                         self.retry_count = 0  # Reset retries for new stream
                         continue  # Go back to main loop with new stream
                     else:
-                        logger.error(f"Health-requested stream switch failed for channel {self.channel_id}")
+                        logger.error(
+                            f"Health-requested stream switch failed for channel {self.channel_id}"
+                        )
                         # Continue with normal flow
 
                 # Check stream type before connecting
                 self.stream_type = detect_stream_type(self.url)
-                if self.transcode == False and self.stream_type in (StreamType.HLS, StreamType.RTSP, StreamType.UDP):
-                    stream_type_name = "HLS" if self.stream_type == StreamType.HLS else ("RTSP/RTP" if self.stream_type == StreamType.RTSP else "UDP")
-                    logger.info(f"Detected {stream_type_name} stream: {self.url} for channel {self.channel_id}")
-                    logger.info(f"{stream_type_name} streams require FFmpeg for channel {self.channel_id}")
+                if self.transcode == False and self.stream_type in (
+                    StreamType.HLS,
+                    StreamType.RTSP,
+                    StreamType.UDP,
+                ):
+                    stream_type_name = (
+                        "HLS"
+                        if self.stream_type == StreamType.HLS
+                        else (
+                            "RTSP/RTP" if self.stream_type == StreamType.RTSP else "UDP"
+                        )
+                    )
+                    logger.info(
+                        f"Detected {stream_type_name} stream: {self.url} for channel {self.channel_id}"
+                    )
+                    logger.info(
+                        f"{stream_type_name} streams require FFmpeg for channel {self.channel_id}"
+                    )
                     # Enable transcoding for HLS, RTSP/RTP, and UDP streams
                     self.transcode = True
                     # We'll override the stream profile selection with ffmpeg in the transcoding section
@@ -245,17 +335,28 @@ class StreamManager:
                 self.retry_count = 0
                 url_failed = False
                 if self.url_switching:
-                    logger.debug(f"Skipping connection attempt during URL switch for channel {self.channel_id}")
+                    logger.debug(
+                        f"Skipping connection attempt during URL switch for channel {self.channel_id}"
+                    )
                     gevent.sleep(0.1)  # REPLACE time.sleep(0.1)
                     continue
                 # Connection retry loop for current URL
-                while self.running and self.retry_count < self.max_retries and not url_failed and not self.needs_stream_switch:
-
-                    logger.info(f"Connection attempt {self.retry_count + 1}/{self.max_retries} for URL: {self.url} for channel {self.channel_id}")
+                while (
+                    self.running
+                    and self.retry_count < self.max_retries
+                    and not url_failed
+                    and not self.needs_stream_switch
+                ):
+                    logger.info(
+                        f"Connection attempt {self.retry_count + 1}/{self.max_retries} for URL: {self.url} for channel {self.channel_id}"
+                    )
 
                     # Handle connection based on whether we transcode or not
                     connection_result = False
                     try:
+                        # Reset DNS failure flag before each attempt
+                        self.dns_failure_detected = False
+
                         if self.transcode:
                             connection_result = self._establish_transcode_connection()
                         else:
@@ -268,16 +369,20 @@ class StreamManager:
                             # Log reconnection event if this is a retry (not first attempt)
                             if self.retry_count > 0:
                                 try:
-                                    channel_obj = Channel.objects.get(uuid=self.channel_id)
+                                    channel_obj = Channel.objects.get(
+                                        uuid=self.channel_id
+                                    )
                                     log_system_event(
-                                        'channel_reconnect',
+                                        "channel_reconnect",
                                         channel_id=self.channel_id,
                                         channel_name=channel_obj.name,
                                         attempt=self.retry_count + 1,
-                                        max_attempts=self.max_retries
+                                        max_attempts=self.max_retries,
                                     )
                                 except Exception as e:
-                                    logger.error(f"Could not log reconnection event: {e}")
+                                    logger.error(
+                                        f"Could not log reconnection event: {e}"
+                                    )
 
                             # Successfully connected - read stream data until disconnect/error
                             self._process_stream_data()
@@ -289,16 +394,39 @@ class StreamManager:
                             stable_connection_threshold = 30  # 30 seconds threshold
 
                             if self.needs_stream_switch:
-                                logger.info(f"Stream needs to switch after {connection_duration:.1f} seconds for channel: {self.channel_id}")
+                                logger.info(
+                                    f"Stream needs to switch after {connection_duration:.1f} seconds for channel: {self.channel_id}"
+                                )
                                 break  # Exit to switch streams
                             if connection_duration > stable_connection_threshold:
-                                logger.info(f"Stream was stable for {connection_duration:.1f} seconds, resetting switch attempts counter for channel: {self.channel_id}")
+                                logger.info(
+                                    f"Stream was stable for {connection_duration:.1f} seconds, resetting switch attempts counter for channel: {self.channel_id}"
+                                )
                                 stream_switch_attempts = 0
 
                         # Connection failed or ended - decide what to do next
                         if self.stop_requested or not self.running:
                             # Normal shutdown requested
                             return
+
+                        # --- Reactive DNS backup: check HTTP reader for DNS failure ---
+                        if (
+                            not self.transcode
+                            and self.http_reader
+                            and getattr(self.http_reader, "dns_failure", False)
+                        ):
+                            self.dns_failure_detected = True
+
+                        # If DNS failure detected, try backup profile before burning retries
+                        if self.dns_failure_detected and not self._backup_tried:
+                            backup_result = self._try_dns_backup()
+                            if backup_result:
+                                # Successfully switched to backup URL — restart
+                                # the retry loop with the new URL
+                                self.retry_count = 0
+                                self.dns_failure_detected = False
+                                break  # break inner retry loop; outer loop re-enters
+                            # else: no backup available, fall through to normal retry
 
                         # Connection failed, increment retry count
                         self.retry_count += 1
@@ -307,29 +435,55 @@ class StreamManager:
                         # If we've reached max retries, mark this URL as failed
                         if self.retry_count >= self.max_retries:
                             url_failed = True
-                            logger.warning(f"Maximum retry attempts ({self.max_retries}) reached for URL: {self.url} for channel: {self.channel_id}")
+                            logger.warning(
+                                f"Maximum retry attempts ({self.max_retries}) reached for URL: {self.url} for channel: {self.channel_id}"
+                            )
 
                             # Log connection error event
                             try:
                                 channel_obj = Channel.objects.get(uuid=self.channel_id)
                                 log_system_event(
-                                    'channel_error',
+                                    "channel_error",
                                     channel_id=self.channel_id,
                                     channel_name=channel_obj.name,
-                                    error_type='connection_failed',
+                                    error_type="connection_failed",
                                     url=self.url[:100] if self.url else None,
-                                    attempts=self.max_retries
+                                    attempts=self.max_retries,
                                 )
                             except Exception as e:
-                                logger.error(f"Could not log connection error event: {e}")
+                                logger.error(
+                                    f"Could not log connection error event: {e}"
+                                )
                         else:
                             # Wait with exponential backoff before retrying
-                            timeout = min(.25 * self.retry_count, 3)  # Cap at 3 seconds
-                            logger.info(f"Reconnecting in {timeout} seconds... (attempt {self.retry_count}/{self.max_retries}) for channel: {self.channel_id}")
+                            timeout = min(
+                                0.25 * self.retry_count, 3
+                            )  # Cap at 3 seconds
+                            logger.info(
+                                f"Reconnecting in {timeout} seconds... (attempt {self.retry_count}/{self.max_retries}) for channel: {self.channel_id}"
+                            )
                             gevent.sleep(timeout)  # REPLACE time.sleep(timeout)
 
                     except Exception as e:
-                        logger.error(f"Connection error on channel: {self.channel_id}: {e}", exc_info=True)
+                        logger.error(
+                            f"Connection error on channel: {self.channel_id}: {e}",
+                            exc_info=True,
+                        )
+
+                        # Check for DNS failure in the exception itself
+                        from .http_streamer import _is_dns_error
+
+                        if _is_dns_error(e):
+                            self.dns_failure_detected = True
+
+                        # Also check transcode stderr detection
+                        if self.dns_failure_detected and not self._backup_tried:
+                            backup_result = self._try_dns_backup()
+                            if backup_result:
+                                self.retry_count = 0
+                                self.dns_failure_detected = False
+                                continue  # retry with backup URL
+
                         self.retry_count += 1
                         self.connected = False
 
@@ -340,38 +494,50 @@ class StreamManager:
                             try:
                                 channel_obj = Channel.objects.get(uuid=self.channel_id)
                                 log_system_event(
-                                    'channel_error',
+                                    "channel_error",
                                     channel_id=self.channel_id,
                                     channel_name=channel_obj.name,
-                                    error_type='connection_exception',
+                                    error_type="connection_exception",
                                     error_message=str(e)[:200],
                                     url=self.url[:100] if self.url else None,
-                                    attempts=self.max_retries
+                                    attempts=self.max_retries,
                                 )
                             except Exception as log_error:
-                                logger.error(f"Could not log connection error event: {log_error}")
+                                logger.error(
+                                    f"Could not log connection error event: {log_error}"
+                                )
                         else:
                             # Wait with exponential backoff before retrying
-                            timeout = min(.25 * self.retry_count, 3)  # Cap at 3 seconds
-                            logger.info(f"Reconnecting in {timeout} seconds after error... (attempt {self.retry_count}/{self.max_retries}) for channel: {self.channel_id}")
+                            timeout = min(
+                                0.25 * self.retry_count, 3
+                            )  # Cap at 3 seconds
+                            logger.info(
+                                f"Reconnecting in {timeout} seconds after error... (attempt {self.retry_count}/{self.max_retries}) for channel: {self.channel_id}"
+                            )
                             gevent.sleep(timeout)  # REPLACE time.sleep(timeout)
 
                 # If URL failed and we're still running, try switching to another stream
                 if url_failed and self.running:
-                    logger.info(f"URL {self.url} failed after {self.retry_count} attempts, trying next stream for channel: {self.channel_id}")
+                    logger.info(
+                        f"URL {self.url} failed after {self.retry_count} attempts, trying next stream for channel: {self.channel_id}"
+                    )
 
                     # Try to switch to next stream
                     switch_result = self._try_next_stream()
                     if switch_result:
                         # Successfully switched to a new stream, continue with the new URL
                         stream_switch_attempts += 1
-                        logger.info(f"Successfully switched to new URL: {self.url} (switch attempt {stream_switch_attempts}/{max_stream_switches}) for channel: {self.channel_id}")
+                        logger.info(
+                            f"Successfully switched to new URL: {self.url} (switch attempt {stream_switch_attempts}/{max_stream_switches}) for channel: {self.channel_id}"
+                        )
                         # Reset retry count for the new stream - important for the loop to work correctly
                         self.retry_count = 0
                         # Continue outer loop with new URL - DON'T add a break statement here
                     else:
                         # No more streams to try
-                        logger.error(f"Failed to find alternative streams after {stream_switch_attempts} attempts for channel: {self.channel_id}")
+                        logger.error(
+                            f"Failed to find alternative streams after {stream_switch_attempts} attempts for channel: {self.channel_id}"
+                        )
                         break
                 elif not self.running:
                     # Normal shutdown was requested
@@ -395,14 +561,16 @@ class StreamManager:
 
             # Make sure transcode process is terminated
             if self.transcode_process_active:
-                logger.info(f"Ensuring transcode process is terminated in finally block for channel: {self.channel_id}")
+                logger.info(
+                    f"Ensuring transcode process is terminated in finally block for channel: {self.channel_id}"
+                )
                 self._close_socket()
 
             # Close all connections
             self._close_all_connections()
 
             # Update channel state in Redis to prevent clients from waiting indefinitely
-            if hasattr(self.buffer, 'redis_client') and self.buffer.redis_client:
+            if hasattr(self.buffer, "redis_client") and self.buffer.redis_client:
                 try:
                     metadata_key = RedisKeys.channel_metadata(self.channel_id)
 
@@ -411,28 +579,39 @@ class StreamManager:
                     current_owner = self.buffer.redis_client.get(owner_key)
 
                     # Use the worker_id that was passed in during initialization
-                    if current_owner and self.worker_id and current_owner.decode('utf-8') == self.worker_id:
+                    if (
+                        current_owner
+                        and self.worker_id
+                        and current_owner.decode("utf-8") == self.worker_id
+                    ):
                         # Determine the appropriate error message based on retry failures
                         if self.tried_stream_ids and len(self.tried_stream_ids) > 0:
                             error_message = f"All {len(self.tried_stream_ids)} stream options failed"
                         else:
-                            error_message = f"Connection failed after {self.max_retries} attempts"
+                            error_message = (
+                                f"Connection failed after {self.max_retries} attempts"
+                            )
 
                         # Update metadata to indicate error state
                         update_data = {
                             ChannelMetadataField.STATE: ChannelState.ERROR,
                             ChannelMetadataField.STATE_CHANGED_AT: str(time.time()),
                             ChannelMetadataField.ERROR_MESSAGE: error_message,
-                            ChannelMetadataField.ERROR_TIME: str(time.time())
+                            ChannelMetadataField.ERROR_TIME: str(time.time()),
                         }
                         self.buffer.redis_client.hset(metadata_key, mapping=update_data)
-                        logger.info(f"Updated channel {self.channel_id} state to ERROR in Redis after stream failure")
+                        logger.info(
+                            f"Updated channel {self.channel_id} state to ERROR in Redis after stream failure"
+                        )
 
                         # Also set stopping key to ensure clients disconnect
                         stop_key = RedisKeys.channel_stopping(self.channel_id)
                         self.buffer.redis_client.setex(stop_key, 60, "true")
                 except Exception as e:
-                    logger.error(f"Failed to update channel state in Redis: {e} for channel {self.channel_id}", exc_info=True)
+                    logger.error(
+                        f"Failed to update channel state in Redis: {e} for channel {self.channel_id}",
+                        exc_info=True,
+                    )
 
             # Close database connection for this thread
             try:
@@ -449,31 +628,44 @@ class StreamManager:
 
             # Check if we already have a running transcode process
             if self.transcode_process and self.transcode_process.poll() is None:
-                logger.info(f"Existing transcode process found for channel {self.channel_id}, closing before establishing new connection")
+                logger.info(
+                    f"Existing transcode process found for channel {self.channel_id}, closing before establishing new connection"
+                )
                 self._close_socket()
 
                 # Wait for the process to fully terminate
                 if not self._wait_for_existing_processes_to_close():
-                    logger.error(f"Failed to close existing transcode process for channel {self.channel_id}")
+                    logger.error(
+                        f"Failed to close existing transcode process for channel {self.channel_id}"
+                    )
                     return False
 
             # Also check for any lingering HTTP connections
             if self.current_response or self.current_session:
-                logger.debug(f"Closing existing HTTP connections before establishing transcode connection for channel {self.channel_id}")
+                logger.debug(
+                    f"Closing existing HTTP connections before establishing transcode connection for channel {self.channel_id}"
+                )
                 self._close_connection()
 
             channel = get_stream_object(self.channel_id)
 
             # Use FFmpeg specifically for HLS streams
-            if hasattr(self, 'force_ffmpeg') and self.force_ffmpeg:
+            if hasattr(self, "force_ffmpeg") and self.force_ffmpeg:
                 from core.models import StreamProfile
+
                 try:
-                    stream_profile = StreamProfile.objects.get(name='ffmpeg', locked=True)
-                    logger.info("Using FFmpeg stream profile for unsupported proxy content (HLS/RTSP/UDP)")
+                    stream_profile = StreamProfile.objects.get(
+                        name="ffmpeg", locked=True
+                    )
+                    logger.info(
+                        "Using FFmpeg stream profile for unsupported proxy content (HLS/RTSP/UDP)"
+                    )
                 except StreamProfile.DoesNotExist:
                     # Fall back to channel's profile if FFmpeg not found
                     stream_profile = channel.get_stream_profile()
-                    logger.warning(f"FFmpeg profile not found, using channel default profile for channel: {self.channel_id}")
+                    logger.warning(
+                        f"FFmpeg profile not found, using channel default profile for channel: {self.channel_id}"
+                    )
             else:
                 stream_profile = channel.get_stream_profile()
 
@@ -484,31 +676,45 @@ class StreamManager:
             self.stream_command = stream_profile.command
             # Map actual commands to parser types for direct routing
             command_to_parser = {
-                'ffmpeg': 'ffmpeg',
-                'cvlc': 'vlc',
-                'vlc': 'vlc',
-                'streamlink': 'streamlink'
+                "ffmpeg": "ffmpeg",
+                "cvlc": "vlc",
+                "vlc": "vlc",
+                "streamlink": "streamlink",
             }
             self.parser_type = command_to_parser.get(self.stream_command.lower())
             if self.parser_type:
-                logger.debug(f"Using {self.parser_type} parser for log parsing (command: {self.stream_command})")
+                logger.debug(
+                    f"Using {self.parser_type} parser for log parsing (command: {self.stream_command})"
+                )
             else:
-                logger.debug(f"Unknown stream command '{self.stream_command}', will use auto-detection for log parsing")
+                logger.debug(
+                    f"Unknown stream command '{self.stream_command}', will use auto-detection for log parsing"
+                )
 
             # For UDP streams, remove any user_agent parameters from the command
-            if hasattr(self, 'stream_type') and self.stream_type == StreamType.UDP:
+            if hasattr(self, "stream_type") and self.stream_type == StreamType.UDP:
                 # Filter out any arguments that contain the user_agent value or related headers
-                self.transcode_cmd = [arg for arg in self.transcode_cmd if self.user_agent not in arg and 'user-agent' not in arg.lower() and 'user_agent' not in arg.lower()]
-                logger.debug(f"Removed user_agent parameters from UDP stream command for channel: {self.channel_id}")
+                self.transcode_cmd = [
+                    arg
+                    for arg in self.transcode_cmd
+                    if self.user_agent not in arg
+                    and "user-agent" not in arg.lower()
+                    and "user_agent" not in arg.lower()
+                ]
+                logger.debug(
+                    f"Removed user_agent parameters from UDP stream command for channel: {self.channel_id}"
+                )
 
-            logger.debug(f"Starting transcode process: {self.transcode_cmd} for channel: {self.channel_id}")
+            logger.debug(
+                f"Starting transcode process: {self.transcode_cmd} for channel: {self.channel_id}"
+            )
 
             # Modified to capture stderr instead of discarding it
             self.transcode_process = subprocess.Popen(
                 self.transcode_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,  # Capture stderr instead of discarding it
-                bufsize=188 * 64            # Buffer optimized for TS packets
+                bufsize=188 * 64,  # Buffer optimized for TS packets
             )
 
             # Start a thread to read stderr
@@ -528,7 +734,10 @@ class StreamManager:
 
             return True
         except Exception as e:
-            logger.error(f"Error establishing transcode connection for channel: {self.channel_id}: {e}", exc_info=True)
+            logger.error(
+                f"Error establishing transcode connection for channel: {self.channel_id}: {e}",
+                exc_info=True,
+            )
             self._close_socket()
             return False
 
@@ -537,7 +746,7 @@ class StreamManager:
         if self.transcode_process and self.transcode_process.stderr:
             self.stderr_reader_thread = threading.Thread(
                 target=self._read_stderr,
-                daemon=True  # Use daemon thread so it doesn't block program exit
+                daemon=True,  # Use daemon thread so it doesn't block program exit
             )
             self.stderr_reader_thread.start()
             logger.debug(f"Started stderr reader thread for channel {self.channel_id}")
@@ -570,7 +779,7 @@ class StreamManager:
                             buffer += next_byte
 
                             # Break on carriage return (stats overwrite) or newline
-                            if next_byte in (b'\r', b'\n'):
+                            if next_byte in (b"\r", b"\n"):
                                 break
 
                             # Also break if we have enough data for a typical stats line
@@ -580,7 +789,9 @@ class StreamManager:
                         # Process the stats line immediately
                         if buffer.strip():
                             try:
-                                stats_text = buffer.decode('utf-8', errors='ignore').strip()
+                                stats_text = buffer.decode(
+                                    "utf-8", errors="ignore"
+                                ).strip()
                                 if stats_text and "frame=" in stats_text:
                                     self._parse_ffmpeg_stats(stats_text)
                                     self._log_stderr_content(stats_text)
@@ -592,27 +803,31 @@ class StreamManager:
                         continue
 
                     # Handle regular line breaks for non-stats content
-                    elif byte == b'\n':
+                    elif byte == b"\n":
                         if buffer.strip():
-                            line_text = buffer.decode('utf-8', errors='ignore').strip()
+                            line_text = buffer.decode("utf-8", errors="ignore").strip()
                             if line_text and not line_text.startswith("frame="):
                                 self._log_stderr_content(line_text)
                         buffer = b""
 
                     # Handle carriage returns (potential stats overwrite)
-                    elif byte == b'\r':
+                    elif byte == b"\r":
                         # Check if this might be a stats line
                         if b"frame=" in buffer:
                             try:
-                                stats_text = buffer.decode('utf-8', errors='ignore').strip()
+                                stats_text = buffer.decode(
+                                    "utf-8", errors="ignore"
+                                ).strip()
                                 if stats_text and "frame=" in stats_text:
                                     self._parse_ffmpeg_stats(stats_text)
                                     self._log_stderr_content(stats_text)
                             except Exception as e:
-                                logger.debug(f"Error parsing stats on carriage return: {e}")
+                                logger.debug(
+                                    f"Error parsing stats on carriage return: {e}"
+                                )
                         elif buffer.strip():
                             # Regular content with carriage return
-                            line_text = buffer.decode('utf-8', errors='ignore').strip()
+                            line_text = buffer.decode("utf-8", errors="ignore").strip()
                             if line_text:
                                 self._log_stderr_content(line_text)
                         buffer = b""
@@ -621,7 +836,7 @@ class StreamManager:
                     elif len(buffer) > 1024 and b"frame=" not in buffer:
                         # Process whatever we have if it's not a stats line
                         if buffer.strip():
-                            line_text = buffer.decode('utf-8', errors='ignore').strip()
+                            line_text = buffer.decode("utf-8", errors="ignore").strip()
                             if line_text:
                                 self._log_stderr_content(line_text)
                         buffer = b""
@@ -633,7 +848,7 @@ class StreamManager:
             # Process any remaining buffer content
             if buffer.strip():
                 try:
-                    remaining_text = buffer.decode('utf-8', errors='ignore').strip()
+                    remaining_text = buffer.decode("utf-8", errors="ignore").strip()
                     if remaining_text:
                         if "frame=" in remaining_text:
                             self._parse_ffmpeg_stats(remaining_text)
@@ -644,7 +859,9 @@ class StreamManager:
         except Exception as e:
             # Catch any other exceptions in the thread to prevent crashes
             try:
-                logger.error(f"Error in stderr reader thread for channel {self.channel_id}: {e}")
+                logger.error(
+                    f"Error in stderr reader thread for channel {self.channel_id}: {e}"
+                )
             except:
                 pass
 
@@ -655,18 +872,26 @@ class StreamManager:
             if not content:
                 return
 
+            # --- Reactive DNS failure detection from transcode stderr ---
+            if not self.dns_failure_detected and is_dns_error_in_text(content):
+                self.dns_failure_detected = True
+                logger.error(
+                    f"DNS resolution failure detected in transcode stderr for "
+                    f"channel {self.channel_id}: {content}"
+                )
+
             # Convert to lowercase for easier matching
             content_lower = content.lower()
             # Check if we are still in the input phase
-            if content_lower.startswith('input #') or 'decoder' in content_lower:
+            if content_lower.startswith("input #") or "decoder" in content_lower:
                 self.ffmpeg_input_phase = True
             # Track FFmpeg phases - once we see output info, we're past input phase
-            if content_lower.startswith('output #') or 'encoder' in content_lower:
+            if content_lower.startswith("output #") or "encoder" in content_lower:
                 self.ffmpeg_input_phase = False
 
             # Route to appropriate parser based on known command type
-            from .services.log_parsers import LogParserFactory
             from .services.channel_service import ChannelService
+            from .services.log_parsers import LogParserFactory
 
             parse_result = None
 
@@ -688,30 +913,56 @@ class StreamManager:
             if parse_result:
                 stream_type, parsed_data = parse_result
                 # For FFmpeg, only parse during input phase
-                if stream_type in ['video', 'audio', 'input']:
+                if stream_type in ["video", "audio", "input"]:
                     if self.ffmpeg_input_phase:
-                        ChannelService.parse_and_store_stream_info(self.channel_id, content, stream_type, self.current_stream_id)
+                        ChannelService.parse_and_store_stream_info(
+                            self.channel_id,
+                            content,
+                            stream_type,
+                            self.current_stream_id,
+                        )
                 else:
                     # VLC and Streamlink can be parsed anytime
-                    ChannelService.parse_and_store_stream_info(self.channel_id, content, stream_type, self.current_stream_id)
+                    ChannelService.parse_and_store_stream_info(
+                        self.channel_id, content, stream_type, self.current_stream_id
+                    )
 
             # Determine log level based on content
-            if any(keyword in content_lower for keyword in ['error', 'failed', 'cannot', 'invalid', 'corrupt']):
-                logger.error(f"Stream process error for channel {self.channel_id}: {content}")
-            elif any(keyword in content_lower for keyword in ['warning', 'deprecated', 'ignoring']):
-                logger.warning(f"Stream process warning for channel {self.channel_id}: {content}")
-            elif content.startswith('frame=') or 'fps=' in content or 'speed=' in content:
+            if any(
+                keyword in content_lower
+                for keyword in ["error", "failed", "cannot", "invalid", "corrupt"]
+            ):
+                logger.error(
+                    f"Stream process error for channel {self.channel_id}: {content}"
+                )
+            elif any(
+                keyword in content_lower
+                for keyword in ["warning", "deprecated", "ignoring"]
+            ):
+                logger.warning(
+                    f"Stream process warning for channel {self.channel_id}: {content}"
+                )
+            elif (
+                content.startswith("frame=") or "fps=" in content or "speed=" in content
+            ):
                 # Stats lines - log at trace level to avoid spam
                 logger.trace(f"Stream stats for channel {self.channel_id}: {content}")
-            elif any(keyword in content_lower for keyword in ['input', 'output', 'stream', 'video', 'audio']):
+            elif any(
+                keyword in content_lower
+                for keyword in ["input", "output", "stream", "video", "audio"]
+            ):
                 # Stream info - log at info level
                 logger.info(f"Stream info for channel {self.channel_id}: {content}")
             else:
                 # Everything else at debug level
-                logger.debug(f"Stream process output for channel {self.channel_id}: {content}")
+                logger.debug(
+                    f"Stream process output for channel {self.channel_id}: {content}"
+                )
 
         except Exception as e:
-            logger.error(f"Error logging stderr content for channel {self.channel_id}: {e}")
+            logger.error(
+                f"Error logging stderr content for channel {self.channel_id}: {e}"
+            )
 
     def _parse_ffmpeg_stats(self, stats_line):
         """Parse FFmpeg stats line and extract speed, fps, and bitrate"""
@@ -720,23 +971,27 @@ class StreamManager:
             # frame= 1234 fps= 30 q=28.0 size=    2048kB time=00:00:41.33 bitrate= 406.1kbits/s speed=1.02x
 
             # Extract speed (e.g., "speed=1.02x")
-            speed_match = re.search(r'speed=\s*([0-9.]+)x?', stats_line)
+            speed_match = re.search(r"speed=\s*([0-9.]+)x?", stats_line)
             ffmpeg_speed = float(speed_match.group(1)) if speed_match else None
 
             # Extract fps (e.g., "fps= 30")
-            fps_match = re.search(r'fps=\s*([0-9.]+)', stats_line)
+            fps_match = re.search(r"fps=\s*([0-9.]+)", stats_line)
             ffmpeg_fps = float(fps_match.group(1)) if fps_match else None
 
             # Extract bitrate (e.g., "bitrate= 406.1kbits/s")
-            bitrate_match = re.search(r'bitrate=\s*([0-9.]+(?:\.[0-9]+)?)\s*([kmg]?)bits/s', stats_line, re.IGNORECASE)
+            bitrate_match = re.search(
+                r"bitrate=\s*([0-9.]+(?:\.[0-9]+)?)\s*([kmg]?)bits/s",
+                stats_line,
+                re.IGNORECASE,
+            )
             ffmpeg_output_bitrate = None
             if bitrate_match:
                 bitrate_value = float(bitrate_match.group(1))
                 unit = bitrate_match.group(2).lower()
                 # Convert to kbps
-                if unit == 'm':
+                if unit == "m":
                     bitrate_value *= 1000
-                elif unit == 'g':
+                elif unit == "g":
                     bitrate_value *= 1000000
                 # If no unit or 'k', it's already in kbps
                 ffmpeg_output_bitrate = bitrate_value
@@ -746,24 +1001,36 @@ class StreamManager:
             if ffmpeg_fps is not None and ffmpeg_speed is not None and ffmpeg_speed > 0:
                 actual_fps = ffmpeg_fps / ffmpeg_speed
             # Store in Redis if we have valid data
-            if any(x is not None for x in [ffmpeg_speed, ffmpeg_fps, actual_fps, ffmpeg_output_bitrate]):
-                self._update_ffmpeg_stats_in_redis(ffmpeg_speed, ffmpeg_fps, actual_fps, ffmpeg_output_bitrate)
+            if any(
+                x is not None
+                for x in [ffmpeg_speed, ffmpeg_fps, actual_fps, ffmpeg_output_bitrate]
+            ):
+                self._update_ffmpeg_stats_in_redis(
+                    ffmpeg_speed, ffmpeg_fps, actual_fps, ffmpeg_output_bitrate
+                )
 
                 # Also save ffmpeg_output_bitrate to database if we have stream_id
                 if ffmpeg_output_bitrate is not None and self.current_stream_id:
                     from .services.channel_service import ChannelService
+
                     ChannelService._update_stream_stats_in_db(
                         self.current_stream_id,
-                        ffmpeg_output_bitrate=ffmpeg_output_bitrate
+                        ffmpeg_output_bitrate=ffmpeg_output_bitrate,
                     )
 
             # Fix the f-string formatting
             actual_fps_str = f"{actual_fps:.1f}" if actual_fps is not None else "N/A"
-            ffmpeg_output_bitrate_str = f"{ffmpeg_output_bitrate:.1f}" if ffmpeg_output_bitrate is not None else "N/A"
+            ffmpeg_output_bitrate_str = (
+                f"{ffmpeg_output_bitrate:.1f}"
+                if ffmpeg_output_bitrate is not None
+                else "N/A"
+            )
             # Log the stats
-            logger.debug(f"FFmpeg stats for channel {self.channel_id}: - Speed: {ffmpeg_speed}x, FFmpeg FPS: {ffmpeg_fps}, "
-                        f"Actual FPS: {actual_fps_str}, "
-                        f"Output Bitrate: {ffmpeg_output_bitrate_str} kbps")
+            logger.debug(
+                f"FFmpeg stats for channel {self.channel_id}: - Speed: {ffmpeg_speed}x, FFmpeg FPS: {ffmpeg_fps}, "
+                f"Actual FPS: {actual_fps_str}, "
+                f"Output Bitrate: {ffmpeg_output_bitrate_str} kbps"
+            )
             # If we have a valid speed, check for buffering
             if ffmpeg_speed is not None and ffmpeg_speed < self.buffering_speed:
                 if self.buffering:
@@ -774,63 +1041,86 @@ class StreamManager:
                         buffering_duration = time.time() - self.buffering_start_time
                         if buffering_duration > self.buffering_timeout:
                             # Buffering timeout reached, log error and try next stream
-                            logger.error(f"Buffering timeout reached for channel {self.channel_id} after {buffering_duration:.1f} seconds")
+                            logger.error(
+                                f"Buffering timeout reached for channel {self.channel_id} after {buffering_duration:.1f} seconds"
+                            )
                             # Send next stream request
                             if self._try_next_stream():
-                                logger.info(f"Switched to next stream for channel {self.channel_id} after buffering timeout")
+                                logger.info(
+                                    f"Switched to next stream for channel {self.channel_id} after buffering timeout"
+                                )
                                 # Reset buffering state
                                 self.buffering = False
                                 self.buffering_start_time = None
 
                                 # Log failover event
                                 try:
-                                    channel_obj = Channel.objects.get(uuid=self.channel_id)
+                                    channel_obj = Channel.objects.get(
+                                        uuid=self.channel_id
+                                    )
                                     log_system_event(
-                                        'channel_failover',
+                                        "channel_failover",
                                         channel_id=self.channel_id,
                                         channel_name=channel_obj.name,
-                                        reason='buffering_timeout',
-                                        duration=buffering_duration
+                                        reason="buffering_timeout",
+                                        duration=buffering_duration,
                                     )
                                 except Exception as e:
                                     logger.error(f"Could not log failover event: {e}")
                             else:
-                                logger.error(f"Failed to switch to next stream for channel {self.channel_id} after buffering timeout")
+                                logger.error(
+                                    f"Failed to switch to next stream for channel {self.channel_id} after buffering timeout"
+                                )
                 else:
                     # Buffering just started, set the flag and start timer
                     self.buffering = True
                     self.buffering_start_time = time.time()
-                    logger.warning(f"Buffering started for channel {self.channel_id} - speed: {ffmpeg_speed}x")
+                    logger.warning(
+                        f"Buffering started for channel {self.channel_id} - speed: {ffmpeg_speed}x"
+                    )
 
                     # Log system event for buffering
                     try:
                         channel_obj = Channel.objects.get(uuid=self.channel_id)
                         log_system_event(
-                            'channel_buffering',
+                            "channel_buffering",
                             channel_id=self.channel_id,
                             channel_name=channel_obj.name,
-                            speed=ffmpeg_speed
+                            speed=ffmpeg_speed,
                         )
                     except Exception as e:
                         logger.error(f"Could not log buffering event: {e}")
 
                 # Log buffering warning
-                logger.debug(f"FFmpeg speed on channel {self.channel_id} is below {self.buffering_speed} ({ffmpeg_speed}x) - buffering detected")
+                logger.debug(
+                    f"FFmpeg speed on channel {self.channel_id} is below {self.buffering_speed} ({ffmpeg_speed}x) - buffering detected"
+                )
                 # Set channel state to buffering
-                if hasattr(self.buffer, 'redis_client') and self.buffer.redis_client:
+                if hasattr(self.buffer, "redis_client") and self.buffer.redis_client:
                     metadata_key = RedisKeys.channel_metadata(self.channel_id)
-                    self.buffer.redis_client.hset(metadata_key, ChannelMetadataField.STATE, ChannelState.BUFFERING)
+                    self.buffer.redis_client.hset(
+                        metadata_key, ChannelMetadataField.STATE, ChannelState.BUFFERING
+                    )
             elif ffmpeg_speed is not None and ffmpeg_speed >= self.buffering_speed:
                 # Speed is good, check if we were buffering
                 if self.buffering:
                     # Reset buffering state
-                    logger.info(f"Buffering ended for channel {self.channel_id} - speed: {ffmpeg_speed}x")
+                    logger.info(
+                        f"Buffering ended for channel {self.channel_id} - speed: {ffmpeg_speed}x"
+                    )
                     self.buffering = False
                     self.buffering_start_time = None
                     # Set channel state to active if speed is good
-                    if hasattr(self.buffer, 'redis_client') and self.buffer.redis_client:
+                    if (
+                        hasattr(self.buffer, "redis_client")
+                        and self.buffer.redis_client
+                    ):
                         metadata_key = RedisKeys.channel_metadata(self.channel_id)
-                        self.buffer.redis_client.hset(metadata_key, ChannelMetadataField.STATE, ChannelState.ACTIVE)
+                        self.buffer.redis_client.hset(
+                            metadata_key,
+                            ChannelMetadataField.STATE,
+                            ChannelState.ACTIVE,
+                        )
 
         except Exception as e:
             logger.debug(f"Error parsing FFmpeg stats: {e}")
@@ -838,29 +1128,34 @@ class StreamManager:
     def _update_ffmpeg_stats_in_redis(self, speed, fps, actual_fps, output_bitrate):
         """Update FFmpeg performance stats in Redis metadata"""
         try:
-            if hasattr(self.buffer, 'redis_client') and self.buffer.redis_client:
+            if hasattr(self.buffer, "redis_client") and self.buffer.redis_client:
                 metadata_key = RedisKeys.channel_metadata(self.channel_id)
                 update_data = {
                     ChannelMetadataField.FFMPEG_STATS_UPDATED: str(time.time())
                 }
 
                 if speed is not None:
-                    update_data[ChannelMetadataField.FFMPEG_SPEED] = str(round(speed, 3))
+                    update_data[ChannelMetadataField.FFMPEG_SPEED] = str(
+                        round(speed, 3)
+                    )
 
                 if fps is not None:
                     update_data[ChannelMetadataField.FFMPEG_FPS] = str(round(fps, 1))
 
                 if actual_fps is not None:
-                    update_data[ChannelMetadataField.ACTUAL_FPS] = str(round(actual_fps, 1))
+                    update_data[ChannelMetadataField.ACTUAL_FPS] = str(
+                        round(actual_fps, 1)
+                    )
 
                 if output_bitrate is not None:
-                    update_data[ChannelMetadataField.FFMPEG_OUTPUT_BITRATE] = str(round(output_bitrate, 1))
+                    update_data[ChannelMetadataField.FFMPEG_OUTPUT_BITRATE] = str(
+                        round(output_bitrate, 1)
+                    )
 
                 self.buffer.redis_client.hset(metadata_key, mapping=update_data)
 
         except Exception as e:
             logger.error(f"Error updating FFmpeg stats in Redis: {e}")
-
 
     def _establish_http_connection(self):
         """Establish HTTP connection using thread-based reader (same as transcode path)"""
@@ -869,17 +1164,23 @@ class StreamManager:
 
             # Check if we already have active HTTP connections
             if self.current_response or self.current_session:
-                logger.info(f"Existing HTTP connection found for channel {self.channel_id}, closing before establishing new connection")
+                logger.info(
+                    f"Existing HTTP connection found for channel {self.channel_id}, closing before establishing new connection"
+                )
                 self._close_connection()
 
                 # Wait for connections to fully close
                 if not self._wait_for_existing_processes_to_close():
-                    logger.error(f"Failed to close existing HTTP connections for channel {self.channel_id}")
+                    logger.error(
+                        f"Failed to close existing HTTP connections for channel {self.channel_id}"
+                    )
                     return False
 
             # Also check for any lingering transcode processes
             if self.transcode_process and self.transcode_process.poll() is None:
-                logger.debug(f"Closing existing transcode process before establishing HTTP connection for channel {self.channel_id}")
+                logger.debug(
+                    f"Closing existing transcode process before establishing HTTP connection for channel {self.channel_id}"
+                )
                 self._close_socket()
 
             # Use HTTPStreamReader to fetch stream and pipe to a readable file descriptor
@@ -888,9 +1189,7 @@ class StreamManager:
 
             # Create and start the HTTP stream reader
             self.http_reader = HTTPStreamReader(
-                url=self.url,
-                user_agent=self.user_agent,
-                chunk_size=self.chunk_size
+                url=self.url, user_agent=self.user_agent, chunk_size=self.chunk_size
             )
 
             # Start the reader thread and get the read end of the pipe
@@ -898,11 +1197,14 @@ class StreamManager:
 
             # Wrap the file descriptor in a file object (same as transcode stdout)
             import os
-            self.socket = os.fdopen(pipe_fd, 'rb', buffering=0)
+
+            self.socket = os.fdopen(pipe_fd, "rb", buffering=0)
             self.connected = True
             self.healthy = True
 
-            logger.info(f"Successfully started HTTP streamer thread for channel {self.channel_id}")
+            logger.info(
+                f"Successfully started HTTP streamer thread for channel {self.channel_id}"
+            )
 
             # Store connection start time for stability tracking
             self.connection_start_time = time.time()
@@ -913,7 +1215,10 @@ class StreamManager:
             return True
 
         except Exception as e:
-            logger.error(f"Error establishing HTTP connection for channel {self.channel_id}: {e}", exc_info=True)
+            logger.error(
+                f"Error establishing HTTP connection for channel {self.channel_id}: {e}",
+                exc_info=True,
+            )
             self._close_socket()
             return False
 
@@ -926,18 +1231,24 @@ class StreamManager:
             # Only update Redis periodically to reduce overhead
             now = time.time()
             if now - self.last_bytes_update >= self.bytes_update_interval:
-                if hasattr(self.buffer, 'redis_client') and self.buffer.redis_client:
+                if hasattr(self.buffer, "redis_client") and self.buffer.redis_client:
                     # Update channel metadata with total bytes
                     metadata_key = RedisKeys.channel_metadata(self.channel_id)
 
                     # Use hincrby to atomically increment the total_bytes field
-                    self.buffer.redis_client.hincrby(metadata_key, ChannelMetadataField.TOTAL_BYTES, self.bytes_processed)
+                    self.buffer.redis_client.hincrby(
+                        metadata_key,
+                        ChannelMetadataField.TOTAL_BYTES,
+                        self.bytes_processed,
+                    )
 
                     # Reset local counter after updating Redis
                     self.bytes_processed = 0
                     self.last_bytes_update = now
 
-                    logger.debug(f"Updated {ChannelMetadataField.TOTAL_BYTES} in Redis for channel {self.channel_id}")
+                    logger.debug(
+                        f"Updated {ChannelMetadataField.TOTAL_BYTES} in Redis for channel {self.channel_id}"
+                    )
         except Exception as e:
             logger.error(f"Error updating bytes processed: {e}")
 
@@ -946,7 +1257,12 @@ class StreamManager:
         try:
             # Both transcode and HTTP now use the same subprocess/socket approach
             # This gives us perfect control: check flags between chunks, timeout just returns False
-            while self.running and self.connected and not self.stop_requested and not self.needs_stream_switch:
+            while (
+                self.running
+                and self.connected
+                and not self.stop_requested
+                and not self.needs_stream_switch
+            ):
                 if self.fetch_chunk():
                     self.last_data_time = time.time()
                 else:
@@ -956,7 +1272,10 @@ class StreamManager:
                     # Brief sleep before retry to avoid tight loop
                     gevent.sleep(0.1)
         except Exception as e:
-            logger.error(f"Error processing stream data for channel {self.channel_id}: {e}", exc_info=True)
+            logger.error(
+                f"Error processing stream data for channel {self.channel_id}: {e}",
+                exc_info=True,
+            )
 
         # If we exit the loop, connection is closed or failed
         self.connected = False
@@ -973,13 +1292,17 @@ class StreamManager:
             try:
                 self.current_response.close()
             except Exception as e:
-                logger.debug(f"Error closing response for channel {self.channel_id}: {e}")
+                logger.debug(
+                    f"Error closing response for channel {self.channel_id}: {e}"
+                )
 
         if self.current_session:
             try:
                 self.current_session.close()
             except Exception as e:
-                logger.debug(f"Error closing session for channel {self.channel_id}: {e}")
+                logger.debug(
+                    f"Error closing session for channel {self.channel_id}: {e}"
+                )
 
         # Clear references
         self.socket = None
@@ -995,8 +1318,8 @@ class StreamManager:
         self.stopping = True
 
         # Release stream resources if we're the owner
-        if self.current_stream_id and hasattr(self, 'worker_id') and self.worker_id:
-            if hasattr(self.buffer, 'redis_client') and self.buffer.redis_client:
+        if self.current_stream_id and hasattr(self, "worker_id") and self.worker_id:
+            if hasattr(self.buffer, "redis_client") and self.buffer.redis_client:
                 owner_key = RedisKeys.channel_owner(self.channel_id)
                 current_owner = self.buffer.redis_client.get(owner_key)
 
@@ -1006,7 +1329,9 @@ class StreamManager:
                 if timer and timer.is_alive():
                     timer.cancel()
             except Exception as e:
-                logger.error(f"Error canceling buffer check timer for channel {self.channel_id}: {e}")
+                logger.error(
+                    f"Error canceling buffer check timer for channel {self.channel_id}: {e}"
+                )
 
         self._buffer_check_timers.clear()
 
@@ -1014,14 +1339,14 @@ class StreamManager:
         self.stop_requested = True
 
         # Close any active response connection
-        if hasattr(self, 'current_response') and self.current_response:  # CORRECT NAME
+        if hasattr(self, "current_response") and self.current_response:  # CORRECT NAME
             try:
                 self.current_response.close()  # CORRECT NAME
             except Exception:
                 pass
 
         # Also close the session
-        if hasattr(self, 'current_session') and self.current_session:
+        if hasattr(self, "current_session") and self.current_session:
             try:
                 self.current_session.close()
             except Exception:
@@ -1039,11 +1364,14 @@ class StreamManager:
             logger.info(f"URL unchanged: {new_url}")
             return False
 
-        logger.info(f"Switching stream URL from {self.url} to {new_url} for channel {self.channel_id}")
+        logger.info(
+            f"Switching stream URL from {self.url} to {new_url} for channel {self.channel_id}"
+        )
 
         # Import both models for proper resource management
-        from apps.channels.models import Stream, Channel
         from django.db import connection
+
+        from apps.channels.models import Channel, Stream
 
         # Update stream profile if we're switching streams
         if self.current_stream_id and stream_id and self.current_stream_id != stream_id:
@@ -1052,18 +1380,24 @@ class StreamManager:
                 channel = Channel.objects.get(uuid=self.channel_id)
 
                 # Get stream to find its profile
-                #new_stream = Stream.objects.get(pk=stream_id)
+                # new_stream = Stream.objects.get(pk=stream_id)
 
                 # Use the new method to update the profile and manage connection counts
                 if m3u_profile_id:
                     success = channel.update_stream_profile(m3u_profile_id)
                     if success:
-                        logger.debug(f"Updated m3u profile for channel {self.channel_id} to use profile from stream {stream_id}")
+                        logger.debug(
+                            f"Updated m3u profile for channel {self.channel_id} to use profile from stream {stream_id}"
+                        )
                     else:
-                        logger.warning(f"Failed to update stream profile for channel {self.channel_id}")
+                        logger.warning(
+                            f"Failed to update stream profile for channel {self.channel_id}"
+                        )
 
             except Exception as e:
-                logger.error(f"Error updating stream profile for channel {self.channel_id}: {e}")
+                logger.error(
+                    f"Error updating stream profile for channel {self.channel_id}: {e}"
+                )
 
             finally:
                 # Always close database connection after profile update
@@ -1079,10 +1413,14 @@ class StreamManager:
         try:
             # Check which type of connection we're using and close it properly
             if self.transcode or self.socket:
-                logger.debug(f"Closing transcode process before URL change for channel {self.channel_id}")
+                logger.debug(
+                    f"Closing transcode process before URL change for channel {self.channel_id}"
+                )
                 self._close_socket()
             else:
-                logger.debug(f"Closing HTTP connection before URL change for channel {self.channel_id}")
+                logger.debug(
+                    f"Closing HTTP connection before URL change for channel {self.channel_id}"
+                )
                 self._close_connection()
 
             # Update URL and reset connection state
@@ -1096,13 +1434,19 @@ class StreamManager:
                 self.current_stream_id = stream_id
                 # Add stream ID to tried streams for proper tracking
                 self.tried_stream_ids.add(stream_id)
-                logger.info(f"Updated stream ID from {old_stream_id} to {stream_id} for channel {self.channel_id}")
+                logger.info(
+                    f"Updated stream ID from {old_stream_id} to {stream_id} for channel {self.channel_id}"
+                )
+
+                # Reset DNS backup flag for the new stream
+                self._backup_tried = False
+                self.dns_failure_detected = False
 
             # Reset retry counter to allow immediate reconnect
             self.retry_count = 0
 
             # Also reset buffer position to prevent stale data after URL change
-            if hasattr(self.buffer, 'reset_buffer_position'):
+            if hasattr(self.buffer, "reset_buffer_position"):
                 try:
                     self.buffer.reset_buffer_position()
                     logger.debug("Reset buffer position for clean URL switch")
@@ -1113,18 +1457,21 @@ class StreamManager:
             try:
                 channel_obj = Channel.objects.get(uuid=self.channel_id)
                 log_system_event(
-                    'stream_switch',
+                    "stream_switch",
                     channel_id=self.channel_id,
                     channel_name=channel_obj.name,
                     new_url=new_url[:100] if new_url else None,
-                    stream_id=stream_id
+                    stream_id=stream_id,
                 )
             except Exception as e:
                 logger.error(f"Could not log stream switch event: {e}")
 
             return True
         except Exception as e:
-            logger.error(f"Error during URL update for channel {self.channel_id}: {e}", exc_info=True)
+            logger.error(
+                f"Error during URL update for channel {self.channel_id}: {e}",
+                exc_info=True,
+            )
             return False
         finally:
             # CRITICAL FIX: Always reset the URL switching flag when done, whether successful or not
@@ -1150,40 +1497,55 @@ class StreamManager:
             try:
                 now = time.time()
                 inactivity_duration = now - self.last_data_time
-                timeout_threshold = getattr(Config, 'CONNECTION_TIMEOUT', 10)
+                timeout_threshold = getattr(Config, "CONNECTION_TIMEOUT", 10)
 
                 if inactivity_duration > timeout_threshold and self.connected:
                     if self.healthy:
-                        logger.warning(f"Stream unhealthy for channel {self.channel_id} - no data for {inactivity_duration:.1f}s")
+                        logger.warning(
+                            f"Stream unhealthy for channel {self.channel_id} - no data for {inactivity_duration:.1f}s"
+                        )
                         self.healthy = False
 
                     consecutive_unhealthy_checks += 1
 
                     # Only set flags if enough time has passed since last action
-                    if (consecutive_unhealthy_checks >= max_unhealthy_checks and
-                        now - self.last_health_action_time > action_cooldown):
-
+                    if (
+                        consecutive_unhealthy_checks >= max_unhealthy_checks
+                        and now - self.last_health_action_time > action_cooldown
+                    ):
                         # Calculate stability to decide on action type
-                        connection_start_time = getattr(self, 'connection_start_time', 0)
-                        stable_time = self.last_data_time - connection_start_time if connection_start_time > 0 else 0
+                        connection_start_time = getattr(
+                            self, "connection_start_time", 0
+                        )
+                        stable_time = (
+                            self.last_data_time - connection_start_time
+                            if connection_start_time > 0
+                            else 0
+                        )
 
                         if stable_time >= 30:  # Stream was stable, try reconnect first
                             if not self.needs_reconnect:
-                                logger.info(f"Setting reconnect flag for stable stream (stable for {stable_time:.1f}s) for channel {self.channel_id}")
+                                logger.info(
+                                    f"Setting reconnect flag for stable stream (stable for {stable_time:.1f}s) for channel {self.channel_id}"
+                                )
                                 self.needs_reconnect = True
                                 self.last_health_action_time = now
                         else:
                             # Stream wasn't stable, suggest stream switch
                             if not self.needs_stream_switch:
-                                logger.info(f"Setting stream switch flag for unstable stream (stable for {stable_time:.1f}s) for channel {self.channel_id}")
+                                logger.info(
+                                    f"Setting stream switch flag for unstable stream (stable for {stable_time:.1f}s) for channel {self.channel_id}"
+                                )
                                 self.needs_stream_switch = True
                                 self.last_health_action_time = now
 
-                        consecutive_unhealthy_checks = 0 # Reset after setting flag
+                        consecutive_unhealthy_checks = 0  # Reset after setting flag
 
                 elif self.connected and not self.healthy:
                     # Auto-recover health when data resumes
-                    logger.info(f"Stream health restored for channel {self.channel_id} - data resumed after {inactivity_duration:.1f}s")
+                    logger.info(
+                        f"Stream health restored for channel {self.channel_id} - data resumed after {inactivity_duration:.1f}s"
+                    )
                     self.healthy = True
                     consecutive_unhealthy_checks = 0
                     # Clear recovery flags when healthy again
@@ -1196,21 +1558,29 @@ class StreamManager:
             except Exception as e:
                 logger.error(f"Error in health monitor: {e}")
 
-            gevent.sleep(self.health_check_interval)  # REPLACE time.sleep(self.health_check_interval)
+            gevent.sleep(
+                self.health_check_interval
+            )  # REPLACE time.sleep(self.health_check_interval)
 
     def _attempt_reconnect(self):
         """Attempt to reconnect to the current stream"""
         try:
-            logger.info(f"Attempting reconnect to current stream for channel {self.channel_id}")
+            logger.info(
+                f"Attempting reconnect to current stream for channel {self.channel_id}"
+            )
 
             # Don't try to reconnect if we're already switching URLs
             if self.url_switching:
-                logger.info(f"URL switching already in progress, skipping reconnect for channel {self.channel_id}")
+                logger.info(
+                    f"URL switching already in progress, skipping reconnect for channel {self.channel_id}"
+                )
                 return False
 
             # Set a flag to prevent concurrent operations
-            if hasattr(self, 'reconnecting') and self.reconnecting:
-                logger.info(f"Reconnect already in progress, skipping for channel {self.channel_id}")
+            if hasattr(self, "reconnecting") and self.reconnecting:
+                logger.info(
+                    f"Reconnect already in progress, skipping for channel {self.channel_id}"
+                )
                 return False
 
             self.reconnecting = True
@@ -1218,15 +1588,21 @@ class StreamManager:
             try:
                 # Close existing connection and wait for it to fully terminate
                 if self.transcode or self.socket:
-                    logger.debug(f"Closing transcode process before reconnect for channel {self.channel_id}")
+                    logger.debug(
+                        f"Closing transcode process before reconnect for channel {self.channel_id}"
+                    )
                     self._close_socket()
                 else:
-                    logger.debug(f"Closing HTTP connection before reconnect for channel {self.channel_id}")
+                    logger.debug(
+                        f"Closing HTTP connection before reconnect for channel {self.channel_id}"
+                    )
                     self._close_connection()
 
                 # Wait for all processes to fully close before attempting reconnect
                 if not self._wait_for_existing_processes_to_close():
-                    logger.warning(f"Some processes may still be running during reconnect for channel {self.channel_id}")
+                    logger.warning(
+                        f"Some processes may still be running during reconnect for channel {self.channel_id}"
+                    )
 
                 self.connected = False
 
@@ -1245,10 +1621,10 @@ class StreamManager:
                     try:
                         channel_obj = Channel.objects.get(uuid=self.channel_id)
                         log_system_event(
-                            'channel_reconnect',
+                            "channel_reconnect",
                             channel_id=self.channel_id,
                             channel_name=channel_obj.name,
-                            reason='health_monitor'
+                            reason="health_monitor",
                         )
                     except Exception as e:
                         logger.error(f"Could not log reconnection event: {e}")
@@ -1262,7 +1638,10 @@ class StreamManager:
                 self.reconnecting = False
 
         except Exception as e:
-            logger.error(f"Error in reconnect attempt for channel {self.channel_id}: {e}", exc_info=True)
+            logger.error(
+                f"Error in reconnect attempt for channel {self.channel_id}: {e}",
+                exc_info=True,
+            )
             self.reconnecting = False
             return False
 
@@ -1273,38 +1652,51 @@ class StreamManager:
 
             # Don't try to switch if we're already in the process of switching URLs
             if self.url_switching:
-                logger.info(f"URL switching already in progress, skipping health recovery for channel {self.channel_id}")
+                logger.info(
+                    f"URL switching already in progress, skipping health recovery for channel {self.channel_id}"
+                )
                 return
 
             # Try to switch to next stream
             switch_result = self._try_next_stream()
             if switch_result:
-                logger.info(f"Health recovery successful - switched to new stream for channel {self.channel_id}")
+                logger.info(
+                    f"Health recovery successful - switched to new stream for channel {self.channel_id}"
+                )
                 return True
             else:
-                logger.warning(f"Health recovery failed - no alternative streams available for channel {self.channel_id}")
+                logger.warning(
+                    f"Health recovery failed - no alternative streams available for channel {self.channel_id}"
+                )
                 return False
 
         except Exception as e:
-            logger.error(f"Error in health recovery attempt for channel {self.channel_id}: {e}", exc_info=True)
+            logger.error(
+                f"Error in health recovery attempt for channel {self.channel_id}: {e}",
+                exc_info=True,
+            )
             return False
 
     def _close_connection(self):
         """Close HTTP connection resources"""
         # Close response if it exists
-        if hasattr(self, 'current_response') and self.current_response:
+        if hasattr(self, "current_response") and self.current_response:
             try:
                 self.current_response.close()
             except Exception as e:
-                logger.debug(f"Error closing response for channel {self.channel_id}: {e}")
+                logger.debug(
+                    f"Error closing response for channel {self.channel_id}: {e}"
+                )
             self.current_response = None
 
         # Close session if it exists
-        if hasattr(self, 'current_session') and self.current_session:
+        if hasattr(self, "current_session") and self.current_session:
             try:
                 self.current_session.close()
             except Exception as e:
-                logger.debug(f"Error closing session for channel {self.channel_id}: {e}")
+                logger.debug(
+                    f"Error closing session for channel {self.channel_id}: {e}"
+                )
             self.current_session = None
 
     def _close_socket(self):
@@ -1314,13 +1706,17 @@ class StreamManager:
             self._close_connection()
 
         # Stop HTTP reader thread if it exists
-        if hasattr(self, 'http_reader') and self.http_reader:
+        if hasattr(self, "http_reader") and self.http_reader:
             try:
-                logger.debug(f"Stopping HTTP reader thread for channel {self.channel_id}")
+                logger.debug(
+                    f"Stopping HTTP reader thread for channel {self.channel_id}"
+                )
                 self.http_reader.stop()
                 self.http_reader = None
             except Exception as e:
-                logger.debug(f"Error stopping HTTP reader for channel {self.channel_id}: {e}")
+                logger.debug(
+                    f"Error stopping HTTP reader for channel {self.channel_id}: {e}"
+                )
 
         # Otherwise handle socket and transcode resources
         if self.socket:
@@ -1340,15 +1736,21 @@ class StreamManager:
                 try:
                     self.transcode_process.wait(timeout=0.5)
                 except subprocess.TimeoutExpired:
-                    logger.error(f"Failed to kill transcode process even with force for channel {self.channel_id}")
+                    logger.error(
+                        f"Failed to kill transcode process even with force for channel {self.channel_id}"
+                    )
             except Exception as e:
-                logger.debug(f"Error terminating transcode process for channel {self.channel_id}: {e}")
+                logger.debug(
+                    f"Error terminating transcode process for channel {self.channel_id}: {e}"
+                )
 
                 # Final attempt: try to kill directly
                 try:
                     self.transcode_process.kill()
                 except Exception as e:
-                    logger.error(f"Final kill attempt failed for channel {self.channel_id}: {e}")
+                    logger.error(
+                        f"Final kill attempt failed for channel {self.channel_id}: {e}"
+                    )
 
             # Explicitly close all subprocess pipes to prevent file descriptor leaks
             try:
@@ -1358,19 +1760,33 @@ class StreamManager:
                     self.transcode_process.stdout.close()
                 if self.transcode_process.stderr:
                     self.transcode_process.stderr.close()
-                logger.debug(f"Closed all subprocess pipes for channel {self.channel_id}")
+                logger.debug(
+                    f"Closed all subprocess pipes for channel {self.channel_id}"
+                )
             except Exception as e:
-                logger.debug(f"Error closing subprocess pipes for channel {self.channel_id}: {e}")
+                logger.debug(
+                    f"Error closing subprocess pipes for channel {self.channel_id}: {e}"
+                )
 
             # Join stderr reader thread to ensure it's fully terminated
-            if hasattr(self, 'stderr_reader_thread') and self.stderr_reader_thread and self.stderr_reader_thread.is_alive():
+            if (
+                hasattr(self, "stderr_reader_thread")
+                and self.stderr_reader_thread
+                and self.stderr_reader_thread.is_alive()
+            ):
                 try:
-                    logger.debug(f"Waiting for stderr reader thread to terminate for channel {self.channel_id}")
+                    logger.debug(
+                        f"Waiting for stderr reader thread to terminate for channel {self.channel_id}"
+                    )
                     self.stderr_reader_thread.join(timeout=2.0)
                     if self.stderr_reader_thread.is_alive():
-                        logger.warning(f"Stderr reader thread did not terminate within timeout for channel {self.channel_id}")
+                        logger.warning(
+                            f"Stderr reader thread did not terminate within timeout for channel {self.channel_id}"
+                        )
                 except Exception as e:
-                    logger.debug(f"Error joining stderr reader thread for channel {self.channel_id}: {e}")
+                    logger.debug(
+                        f"Error joining stderr reader thread for channel {self.channel_id}: {e}"
+                    )
                 finally:
                     self.stderr_reader_thread = None
 
@@ -1378,13 +1794,17 @@ class StreamManager:
             self.transcode_process_active = False  # Reset the flag
 
             # Clear transcode active key in Redis if available
-            if hasattr(self.buffer, 'redis_client') and self.buffer.redis_client:
+            if hasattr(self.buffer, "redis_client") and self.buffer.redis_client:
                 try:
                     transcode_key = RedisKeys.transcode_active(self.channel_id)
                     self.buffer.redis_client.delete(transcode_key)
-                    logger.debug(f"Cleared transcode active flag for channel {self.channel_id}")
+                    logger.debug(
+                        f"Cleared transcode active flag for channel {self.channel_id}"
+                    )
                 except Exception as e:
-                    logger.debug(f"Error clearing transcode flag for channel {self.channel_id}: {e}")
+                    logger.debug(
+                        f"Error clearing transcode flag for channel {self.channel_id}: {e}"
+                    )
         self.socket = None
         self.connected = False
         # Cancel any remaining buffer check timers
@@ -1392,9 +1812,13 @@ class StreamManager:
             try:
                 if timer and timer.is_alive():
                     timer.cancel()
-                    logger.debug(f"Cancelled buffer check timer during socket close for channel {self.channel_id}")
+                    logger.debug(
+                        f"Cancelled buffer check timer during socket close for channel {self.channel_id}"
+                    )
             except Exception as e:
-                logger.debug(f"Error canceling timer during socket close for channel {self.channel_id}: {e}")
+                logger.debug(
+                    f"Error canceling timer during socket close for channel {self.channel_id}: {e}"
+                )
 
         self._buffer_check_timers = []
 
@@ -1405,11 +1829,13 @@ class StreamManager:
 
         try:
             # Set timeout for chunk reads
-            chunk_timeout = ConfigHelper.chunk_timeout()  # Use centralized timeout configuration
+            chunk_timeout = (
+                ConfigHelper.chunk_timeout()
+            )  # Use centralized timeout configuration
 
             try:
                 # Handle different socket types with timeout
-                if hasattr(self.socket, 'recv'):
+                if hasattr(self.socket, "recv"):
                     # Standard socket - set timeout
                     original_timeout = self.socket.gettimeout()
                     self.socket.settimeout(chunk_timeout)
@@ -1418,23 +1844,30 @@ class StreamManager:
                 else:
                     # SocketIO object (transcode process stdout) - use select for timeout
                     import select
+
                     ready, _, _ = select.select([self.socket], [], [], chunk_timeout)
 
                     if not ready:
                         # Timeout occurred
-                        logger.debug(f"Chunk read timeout ({chunk_timeout}s) for channel {self.channel_id}")
+                        logger.debug(
+                            f"Chunk read timeout ({chunk_timeout}s) for channel {self.channel_id}"
+                        )
                         return False
 
                     chunk = self.socket.read(Config.CHUNK_SIZE)
 
             except socket.timeout:
                 # Socket timeout occurred
-                logger.debug(f"Socket timeout ({chunk_timeout}s) for channel {self.channel_id}")
+                logger.debug(
+                    f"Socket timeout ({chunk_timeout}s) for channel {self.channel_id}"
+                )
                 return False
 
             if not chunk:
                 # Connection closed by server
-                logger.warning(f"Server closed connection for channel {self.channel_id}")
+                logger.warning(
+                    f"Server closed connection for channel {self.channel_id}"
+                )
                 self._close_socket()
                 self.connected = False
                 return False
@@ -1447,7 +1880,11 @@ class StreamManager:
             success = self.buffer.add_chunk(chunk)
 
             # Update last data timestamp in Redis if successful
-            if success and hasattr(self.buffer, 'redis_client') and self.buffer.redis_client:
+            if (
+                success
+                and hasattr(self.buffer, "redis_client")
+                and self.buffer.redis_client
+            ):
                 last_data_key = RedisKeys.last_data(self.buffer.channel_id)
                 self.buffer.redis_client.set(last_data_key, str(time.time()), ex=60)
 
@@ -1467,7 +1904,9 @@ class StreamManager:
     def _set_waiting_for_clients(self):
         """Set channel state to waiting for clients AFTER buffer has enough chunks"""
         try:
-            if hasattr(self.buffer, 'channel_id') and hasattr(self.buffer, 'redis_client'):
+            if hasattr(self.buffer, "channel_id") and hasattr(
+                self.buffer, "redis_client"
+            ):
                 channel_id = self.buffer.channel_id
                 redis_client = self.buffer.redis_client
 
@@ -1479,14 +1918,17 @@ class StreamManager:
                     current_state = None
                     try:
                         metadata = redis_client.hgetall(metadata_key)
-                        state_field = ChannelMetadataField.STATE.encode('utf-8')
+                        state_field = ChannelMetadataField.STATE.encode("utf-8")
                         if metadata and state_field in metadata:
-                            current_state = metadata[state_field].decode('utf-8')
+                            current_state = metadata[state_field].decode("utf-8")
                     except Exception as e:
                         logger.error(f"Error checking current state: {e}")
 
                     # Only update if not already past connecting
-                    if not current_state or current_state in [ChannelState.INITIALIZING, ChannelState.CONNECTING]:
+                    if not current_state or current_state in [
+                        ChannelState.INITIALIZING,
+                        ChannelState.CONNECTING,
+                    ]:
                         # NEW CODE: Check if buffer has enough chunks
                         # IMPORTANT: Read from Redis, not local buffer.index, because in multi-worker setup
                         # each worker has its own StreamBuffer instance with potentially stale local index
@@ -1506,13 +1948,17 @@ class StreamManager:
                             if current_state != ChannelState.CONNECTING:
                                 update_data = {
                                     ChannelMetadataField.STATE: ChannelState.CONNECTING,
-                                    ChannelMetadataField.STATE_CHANGED_AT: current_time
+                                    ChannelMetadataField.STATE_CHANGED_AT: current_time,
                                 }
                                 redis_client.hset(metadata_key, mapping=update_data)
-                                logger.info(f"Channel {channel_id} connected but waiting for buffer to fill: {current_buffer_index}/{initial_chunks_needed} chunks")
+                                logger.info(
+                                    f"Channel {channel_id} connected but waiting for buffer to fill: {current_buffer_index}/{initial_chunks_needed} chunks"
+                                )
 
                             # Schedule a retry to check buffer status again
-                            timer = threading.Timer(0.5, self._check_buffer_and_set_state)
+                            timer = threading.Timer(
+                                0.5, self._check_buffer_and_set_state
+                            )
                             timer.daemon = True
                             timer.start()
                             return False
@@ -1522,31 +1968,51 @@ class StreamManager:
                             ChannelMetadataField.STATE: ChannelState.WAITING_FOR_CLIENTS,
                             ChannelMetadataField.CONNECTION_READY_TIME: current_time,
                             ChannelMetadataField.STATE_CHANGED_AT: current_time,
-                            ChannelMetadataField.BUFFER_CHUNKS: str(current_buffer_index)
+                            ChannelMetadataField.BUFFER_CHUNKS: str(
+                                current_buffer_index
+                            ),
                         }
                         redis_client.hset(metadata_key, mapping=update_data)
 
                         # Get configured grace period or default
                         grace_period = ConfigHelper.channel_init_grace_period()
-                        logger.info(f"STREAM MANAGER: Updated channel {channel_id} state: {current_state or 'None'} -> {ChannelState.WAITING_FOR_CLIENTS} with {current_buffer_index} buffer chunks")
-                        logger.info(f"Started initial connection grace period ({grace_period}s) for channel {channel_id}")
+                        logger.info(
+                            f"STREAM MANAGER: Updated channel {channel_id} state: {current_state or 'None'} -> {ChannelState.WAITING_FOR_CLIENTS} with {current_buffer_index} buffer chunks"
+                        )
+                        logger.info(
+                            f"Started initial connection grace period ({grace_period}s) for channel {channel_id}"
+                        )
                     else:
-                        logger.debug(f"Not changing state: channel {channel_id} already in {current_state} state")
+                        logger.debug(
+                            f"Not changing state: channel {channel_id} already in {current_state} state"
+                        )
         except Exception as e:
-            logger.error(f"Error setting waiting for clients state for channel {channel_id}: {e}")
+            logger.error(
+                f"Error setting waiting for clients state for channel {channel_id}: {e}"
+            )
 
     def _check_buffer_and_set_state(self):
         """Check buffer size and set state to waiting_for_clients when ready"""
         try:
             # Enhanced stop detection with short-circuit return
-            if not self.running or getattr(self, 'stopping', False) or getattr(self, 'reconnecting', False):
-                logger.debug(f"Buffer check aborted - channel {self.buffer.channel_id} is stopping or reconnecting")
+            if (
+                not self.running
+                or getattr(self, "stopping", False)
+                or getattr(self, "reconnecting", False)
+            ):
+                logger.debug(
+                    f"Buffer check aborted - channel {self.buffer.channel_id} is stopping or reconnecting"
+                )
                 return False  # Return value to indicate check was aborted
 
             # Clean up completed timers
-            self._buffer_check_timers = [t for t in self._buffer_check_timers if t.is_alive()]
+            self._buffer_check_timers = [
+                t for t in self._buffer_check_timers if t.is_alive()
+            ]
 
-            if hasattr(self.buffer, 'channel_id') and hasattr(self.buffer, 'redis_client'):
+            if hasattr(self.buffer, "channel_id") and hasattr(
+                self.buffer, "redis_client"
+            ):
                 channel_id = self.buffer.channel_id
                 redis_client = self.buffer.redis_client
 
@@ -1560,18 +2026,24 @@ class StreamManager:
                 except Exception as e:
                     logger.error(f"Error reading buffer index from Redis: {e}")
 
-                initial_chunks_needed = ConfigHelper.initial_behind_chunks()  # Use ConfigHelper for consistency
+                initial_chunks_needed = (
+                    ConfigHelper.initial_behind_chunks()
+                )  # Use ConfigHelper for consistency
 
                 if current_buffer_index >= initial_chunks_needed:
                     # We now have enough buffer, call _set_waiting_for_clients again
-                    logger.info(f"Buffer threshold reached for channel {channel_id}: {current_buffer_index}/{initial_chunks_needed} chunks")
+                    logger.info(
+                        f"Buffer threshold reached for channel {channel_id}: {current_buffer_index}/{initial_chunks_needed} chunks"
+                    )
                     self._set_waiting_for_clients()
                 else:
                     # Still waiting, log progress and schedule another check
-                    logger.debug(f"Buffer filling for channel {channel_id}: {current_buffer_index}/{initial_chunks_needed} chunks")
+                    logger.debug(
+                        f"Buffer filling for channel {channel_id}: {current_buffer_index}/{initial_chunks_needed} chunks"
+                    )
 
                     # Schedule another check - NOW WITH STOPPING CHECK
-                    if self.running and not getattr(self, 'stopping', False):
+                    if self.running and not getattr(self, "stopping", False):
                         timer = threading.Timer(0.5, self._check_buffer_and_set_state)
                         timer.daemon = True
                         timer.start()
@@ -1591,60 +2063,88 @@ class StreamManager:
             bool: True if successfully switched to a new stream, False otherwise
         """
         try:
-            logger.info(f"Trying to find alternative stream for channel {self.channel_id}, current stream ID: {self.current_stream_id}")
+            logger.info(
+                f"Trying to find alternative stream for channel {self.channel_id}, current stream ID: {self.current_stream_id}"
+            )
 
             # Get alternate streams excluding the current one
-            alternate_streams = get_alternate_streams(self.channel_id, self.current_stream_id)
-            logger.info(f"Found {len(alternate_streams)} potential alternate streams for channel {self.channel_id}")
+            alternate_streams = get_alternate_streams(
+                self.channel_id, self.current_stream_id
+            )
+            logger.info(
+                f"Found {len(alternate_streams)} potential alternate streams for channel {self.channel_id}"
+            )
 
             # Filter out streams we've already tried
-            untried_streams = [s for s in alternate_streams if s['stream_id'] not in self.tried_stream_ids]
+            untried_streams = [
+                s
+                for s in alternate_streams
+                if s["stream_id"] not in self.tried_stream_ids
+            ]
             if untried_streams:
-                ids_to_try = ', '.join([str(s['stream_id']) for s in untried_streams])
-                logger.info(f"Found {len(untried_streams)} untried streams for channel {self.channel_id}: [{ids_to_try}]")
+                ids_to_try = ", ".join([str(s["stream_id"]) for s in untried_streams])
+                logger.info(
+                    f"Found {len(untried_streams)} untried streams for channel {self.channel_id}: [{ids_to_try}]"
+                )
             else:
-                logger.warning(f"No untried streams available for channel {self.channel_id}, tried: {self.tried_stream_ids}")
+                logger.warning(
+                    f"No untried streams available for channel {self.channel_id}, tried: {self.tried_stream_ids}"
+                )
 
             if not untried_streams:
                 # Check if we have streams but they've all been tried
                 if alternate_streams and len(self.tried_stream_ids) > 0:
-                    logger.warning(f"All {len(alternate_streams)} alternate streams have been tried for channel {self.channel_id}")
+                    logger.warning(
+                        f"All {len(alternate_streams)} alternate streams have been tried for channel {self.channel_id}"
+                    )
                 return False
 
             # IMPROVED: Try multiple streams until we find one with a different URL
             for next_stream in untried_streams:
-                stream_id = next_stream['stream_id']
-                profile_id = next_stream['profile_id']  # This is the M3U profile ID we need
+                stream_id = next_stream["stream_id"]
+                profile_id = next_stream[
+                    "profile_id"
+                ]  # This is the M3U profile ID we need
 
                 # Add to tried streams
                 self.tried_stream_ids.add(stream_id)
 
                 # Get stream info including URL using the profile_id we already have
-                logger.info(f"Trying next stream ID {stream_id} with profile ID {profile_id} for channel {self.channel_id}")
+                logger.info(
+                    f"Trying next stream ID {stream_id} with profile ID {profile_id} for channel {self.channel_id}"
+                )
                 stream_info = get_stream_info_for_switch(self.channel_id, stream_id)
 
-                if 'error' in stream_info or not stream_info.get('url'):
-                    logger.error(f"Error getting info for stream {stream_id} for channel {self.channel_id}: {stream_info.get('error', 'No URL')}")
+                if "error" in stream_info or not stream_info.get("url"):
+                    logger.error(
+                        f"Error getting info for stream {stream_id} for channel {self.channel_id}: {stream_info.get('error', 'No URL')}"
+                    )
                     continue  # Try next stream instead of giving up
 
                 # Update URL and user agent
-                new_url = stream_info['url']
-                new_user_agent = stream_info['user_agent']
-                new_transcode = stream_info['transcode']
+                new_url = stream_info["url"]
+                new_user_agent = stream_info["user_agent"]
+                new_transcode = stream_info["transcode"]
 
                 # CRITICAL FIX: Check if the new URL is the same as current URL
                 # This can happen when current_stream_id is None and we accidentally select the same stream
                 if new_url == self.url:
-                    logger.warning(f"Stream ID {stream_id} generates the same URL as current stream ({new_url}). "
-                                 f"Skipping this stream and trying next alternative.")
+                    logger.warning(
+                        f"Stream ID {stream_id} generates the same URL as current stream ({new_url}). "
+                        f"Skipping this stream and trying next alternative."
+                    )
                     continue  # Try next stream instead of giving up
 
-                logger.info(f"Switching from URL {self.url} to {new_url} for channel {self.channel_id}")
+                logger.info(
+                    f"Switching from URL {self.url} to {new_url} for channel {self.channel_id}"
+                )
 
                 # IMPORTANT: Just update the URL, don't stop the channel or release resources
                 switch_result = self.update_url(new_url, stream_id, profile_id)
                 if not switch_result:
-                    logger.error(f"Failed to update URL for stream ID {stream_id} for channel {self.channel_id}")
+                    logger.error(
+                        f"Failed to update URL for stream ID {stream_id} for channel {self.channel_id}"
+                    )
                     continue  # Try next stream
 
                 # Update stream ID tracking
@@ -1654,32 +2154,143 @@ class StreamManager:
                 self.user_agent = new_user_agent
                 self.transcode = new_transcode
 
+                # Reset DNS backup flag so backup-only profiles can be
+                # attempted for this new stream if needed.
+                self._backup_tried = False
+                self.dns_failure_detected = False
+
                 # Update stream metadata in Redis - use the profile_id we got from get_alternate_streams
-                if hasattr(self.buffer, 'redis_client') and self.buffer.redis_client:
+                if hasattr(self.buffer, "redis_client") and self.buffer.redis_client:
                     metadata_key = RedisKeys.channel_metadata(self.channel_id)
-                    self.buffer.redis_client.hset(metadata_key, mapping={
-                        ChannelMetadataField.URL: new_url,
-                        ChannelMetadataField.USER_AGENT: new_user_agent,
-                        ChannelMetadataField.STREAM_PROFILE: stream_info['stream_profile'],
-                        ChannelMetadataField.M3U_PROFILE: str(profile_id),  # Use the profile_id from get_alternate_streams
-                        ChannelMetadataField.STREAM_ID: str(stream_id),
-                        ChannelMetadataField.STREAM_SWITCH_TIME: str(time.time()),
-                        ChannelMetadataField.STREAM_SWITCH_REASON: "max_retries_exceeded"
-                    })
+                    self.buffer.redis_client.hset(
+                        metadata_key,
+                        mapping={
+                            ChannelMetadataField.URL: new_url,
+                            ChannelMetadataField.USER_AGENT: new_user_agent,
+                            ChannelMetadataField.STREAM_PROFILE: stream_info[
+                                "stream_profile"
+                            ],
+                            ChannelMetadataField.M3U_PROFILE: str(
+                                profile_id
+                            ),  # Use the profile_id from get_alternate_streams
+                            ChannelMetadataField.STREAM_ID: str(stream_id),
+                            ChannelMetadataField.STREAM_SWITCH_TIME: str(time.time()),
+                            ChannelMetadataField.STREAM_SWITCH_REASON: "max_retries_exceeded",
+                        },
+                    )
 
                     # Log the switch
-                    logger.info(f"Stream metadata updated for channel {self.channel_id} to stream ID {stream_id} with M3U profile {profile_id}")
+                    logger.info(
+                        f"Stream metadata updated for channel {self.channel_id} to stream ID {stream_id} with M3U profile {profile_id}"
+                    )
 
-                logger.info(f"Successfully switched to stream ID {stream_id} with URL {new_url} for channel {self.channel_id}")
+                logger.info(
+                    f"Successfully switched to stream ID {stream_id} with URL {new_url} for channel {self.channel_id}"
+                )
                 return True
 
             # If we get here, we tried all streams but none worked
-            logger.error(f"Tried {len(untried_streams)} alternate streams but none were suitable for channel {self.channel_id}")
+            logger.error(
+                f"Tried {len(untried_streams)} alternate streams but none were suitable for channel {self.channel_id}"
+            )
             return False
 
         except Exception as e:
-            logger.error(f"Error trying next stream for channel {self.channel_id}: {e}", exc_info=True)
+            logger.error(
+                f"Error trying next stream for channel {self.channel_id}: {e}",
+                exc_info=True,
+            )
             return False
+
+    def _try_dns_backup(self):
+        """
+        Attempt to switch to a backup-only profile after a DNS resolution
+        failure has been detected on the current stream URL.
+
+        This is called reactively — only after the real connection attempt
+        (HTTP or transcode) has failed with a DNS error.  No proactive DNS
+        lookups are performed.
+
+        Returns:
+            bool: True if successfully switched to a backup profile URL.
+        """
+        if self._backup_tried:
+            return False
+
+        self._backup_tried = True  # Only try once per stream
+
+        if not self.current_stream_id:
+            logger.debug(
+                f"No stream ID available for DNS backup lookup on channel {self.channel_id}"
+            )
+            return False
+
+        logger.info(
+            f"DNS failure detected for channel {self.channel_id} stream {self.current_stream_id}, "
+            f"attempting backup-only profile lookup"
+        )
+
+        backup_info = get_backup_profile_url(self.current_stream_id, self.channel_id)
+        if not backup_info:
+            logger.warning(
+                f"No backup-only profiles available for stream {self.current_stream_id} "
+                f"on channel {self.channel_id}"
+            )
+            return False
+
+        new_url = backup_info["url"]
+        new_user_agent = backup_info.get("user_agent", self.user_agent)
+        backup_profile_id = backup_info["profile_id"]
+
+        logger.info(
+            f"Switching to backup profile {backup_profile_id} with URL {new_url} "
+            f"for channel {self.channel_id} (DNS failure on primary)"
+        )
+
+        # Close existing connections before switching
+        if self.transcode or self.socket:
+            self._close_socket()
+        else:
+            self._close_connection()
+
+        # Update the URL directly (not via update_url which checks for same URL)
+        self.url = new_url
+        self.user_agent = new_user_agent
+        self.connected = False
+
+        # Update Redis metadata
+        if hasattr(self.buffer, "redis_client") and self.buffer.redis_client:
+            try:
+                metadata_key = RedisKeys.channel_metadata(self.channel_id)
+                self.buffer.redis_client.hset(
+                    metadata_key,
+                    mapping={
+                        ChannelMetadataField.URL: new_url,
+                        ChannelMetadataField.USER_AGENT: new_user_agent,
+                        ChannelMetadataField.M3U_PROFILE: str(backup_profile_id),
+                        ChannelMetadataField.STREAM_SWITCH_TIME: str(time.time()),
+                        ChannelMetadataField.STREAM_SWITCH_REASON: "dns_failure_backup",
+                    },
+                )
+            except Exception as e:
+                logger.error(f"Failed to update Redis metadata for DNS backup: {e}")
+
+        # Log the event
+        try:
+            channel_obj = Channel.objects.get(uuid=self.channel_id)
+            log_system_event(
+                "stream_switch",
+                channel_id=self.channel_id,
+                channel_name=channel_obj.name,
+                new_url=new_url[:100] if new_url else None,
+                stream_id=self.current_stream_id,
+                reason="dns_failure_backup",
+                backup_profile_id=backup_profile_id,
+            )
+        except Exception as e:
+            logger.error(f"Could not log DNS backup switch event: {e}")
+
+        return True
 
     # Add a new helper method to safely reset the URL switching state
     def _reset_url_switching_state(self):
