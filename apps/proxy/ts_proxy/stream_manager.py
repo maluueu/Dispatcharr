@@ -1708,6 +1708,9 @@ class StreamManager:
         # Stop HTTP reader thread if it exists
         if hasattr(self, "http_reader") and self.http_reader:
             try:
+                # Latch the DNS failure flag before destroying the reader
+                if getattr(self.http_reader, "dns_failure", False):
+                    self.dns_failure_detected = True
                 logger.debug(
                     f"Stopping HTTP reader thread for channel {self.channel_id}"
                 )
