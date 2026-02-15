@@ -336,7 +336,7 @@ const RegexFormAndView = ({ profile = null, m3u, isOpen, onClose }) => {
           <Grid gutter="xs">
             <Grid.Col span={12}>
               <Paper shadow="sm" p="xs" radius="md" withBorder>
-                <Text size="sm" weight={500} mb={3}>
+                <Text component="div" size="sm" weight={500} mb={3}>
                   Matched Text{' '}
                   <Badge size="xs" color="yellow">
                     highlighted
