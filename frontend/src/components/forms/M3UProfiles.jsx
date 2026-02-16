@@ -229,7 +229,7 @@ const M3UProfiles = ({ playlist = null, isOpen, onClose }) => {
                           <Text fw={600}>{item.name}</Text>
                           {item.is_backup_only && (
                             <Tooltip
-                              label="Backup Only — used when primary profile's DNS fails"
+                              label="Backup Only — used when primary connection fails"
                               withArrow
                             >
                               <Badge

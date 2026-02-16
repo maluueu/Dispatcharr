@@ -14,7 +14,7 @@ class Migration(migrations.Migration):
             name="is_backup_only",
             field=models.BooleanField(
                 default=False,
-                help_text="Only use this profile as failover when the primary profile URL fails DNS resolution. Backup profiles share the connection limit with the default profile.",
+                help_text="Only use this profile as failover when the primary connection fails. Not used during normal stream selection.",
             ),
         ),
     ]

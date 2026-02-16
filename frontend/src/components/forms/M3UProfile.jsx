@@ -267,15 +267,15 @@ const RegexFormAndView = ({ profile = null, m3u, isOpen, onClose }) => {
         {/* Backup-only toggle — only for non-default profiles */}
         {!isDefaultProfile && (
           <Tooltip
-            label="When enabled, this profile will only be used when the primary profile's URL fails DNS resolution. Useful for providing a failover server."
+            label="When enabled, this profile is excluded from normal stream selection and only used as failover when the primary connection fails."
             multiline
             w={300}
             withArrow
             position="top-start"
           >
             <Switch
-              label="Backup Only (DNS Failover)"
-              description="Only use this profile when the primary URL's DNS fails"
+              label="Backup Only (Failover)"
+              description="Only use this profile when the primary connection fails"
               checked={isBackupOnly}
               onChange={(event) =>
                 setValue('is_backup_only', event.currentTarget.checked)

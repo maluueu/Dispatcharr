@@ -1,15 +1,17 @@
-from django.db import models
-from django.core.exceptions import ValidationError
-from django.conf import settings
-from core.models import StreamProfile, CoreSettings
-from core.utils import RedisClient
+import hashlib
+import json
 import logging
 import uuid
 from datetime import datetime
-import hashlib
-import json
-from apps.epg.models import EPGData
+
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.db import models
+
 from apps.accounts.models import User
+from apps.epg.models import EPGData
+from core.models import CoreSettings, StreamProfile
+from core.utils import RedisClient
 
 logger = logging.getLogger(__name__)
 
@@ -97,12 +99,12 @@ class Stream(models.Model):
     is_stale = models.BooleanField(
         default=False,
         db_index=True,
-        help_text="Whether this stream is stale (not seen in recent refresh, pending deletion)"
+        help_text="Whether this stream is stale (not seen in recent refresh, pending deletion)",
     )
     is_adult = models.BooleanField(
         default=False,
         db_index=True,
-        help_text="Whether this stream contains adult content"
+        help_text="Whether this stream contains adult content",
     )
     custom_properties = models.JSONField(default=dict, blank=True, null=True)
 
@@ -110,26 +112,26 @@ class Stream(models.Model):
         null=True,
         blank=True,
         db_index=True,
-        help_text="Provider stream ID (e.g., XC stream_id) for stable identity across credential changes"
+        help_text="Provider stream ID (e.g., XC stream_id) for stable identity across credential changes",
     )
     stream_chno = models.FloatField(
         null=True,
         blank=True,
         db_index=True,
-        help_text="Provider channel number (XC num or M3U tvg-chno) for ordering - supports decimals like 2.1"
+        help_text="Provider channel number (XC num or M3U tvg-chno) for ordering - supports decimals like 2.1",
     )
 
     # Stream statistics fields
     stream_stats = models.JSONField(
         null=True,
         blank=True,
-        help_text="JSON object containing stream statistics like video codec, resolution, etc."
+        help_text="JSON object containing stream statistics like video codec, resolution, etc.",
     )
     stream_stats_updated_at = models.DateTimeField(
         null=True,
         blank=True,
         help_text="When stream statistics were last updated",
-        db_index=True
+        db_index=True,
     )
 
     class Meta:
@@ -142,26 +144,41 @@ class Stream(models.Model):
         return self.name or self.url or f"Stream ID {self.id}"
 
     @classmethod
-    def generate_hash_key(cls, name, url, tvg_id, keys=None, m3u_id=None, group=None,
-                          account_type=None, stream_id=None):
+    def generate_hash_key(
+        cls,
+        name,
+        url,
+        tvg_id,
+        keys=None,
+        m3u_id=None,
+        group=None,
+        account_type=None,
+        stream_id=None,
+    ):
         if keys is None:
             keys = CoreSettings.get_m3u_hash_key().split(",")
 
         # For XC accounts, use stream_id instead of url when 'url' is in the hash keys
         # This ensures credential/URL changes don't break stream identity
         effective_url = url
-        use_stream_id = account_type == 'XC' and stream_id and 'url' in keys
+        use_stream_id = account_type == "XC" and stream_id and "url" in keys
         if use_stream_id:
             effective_url = stream_id
 
-        stream_parts = {"name": name, "url": effective_url, "tvg_id": tvg_id, "m3u_id": m3u_id, "group": group}
+        stream_parts = {
+            "name": name,
+            "url": effective_url,
+            "tvg_id": tvg_id,
+            "m3u_id": m3u_id,
+            "group": group,
+        }
 
         hash_parts = {key: stream_parts[key] for key in keys if key in stream_parts}
 
         # When using stream_id instead of URL, we MUST include m3u_id to prevent
         # collisions across different XC accounts (stream_id is only unique per account)
-        if use_stream_id and 'm3u_id' not in hash_parts:
-            hash_parts['m3u_id'] = m3u_id
+        if use_stream_id and "m3u_id" not in hash_parts:
+            hash_parts["m3u_id"] = m3u_id
 
         # Serialize and hash the dictionary
         serialized_obj = json.dumps(
@@ -227,7 +244,7 @@ class Stream(models.Model):
                 continue
 
             # Skip backup-only profiles during normal selection
-            # They are only used when DNS resolution fails on primary profiles
+            # They are only used as failover when the primary connection fails
             if profile.is_backup_only:
                 continue
 
@@ -340,12 +357,12 @@ class Channel(models.Model):
     is_adult = models.BooleanField(
         default=False,
         db_index=True,
-        help_text="Whether this channel contains adult content"
+        help_text="Whether this channel contains adult content",
     )
 
     auto_created = models.BooleanField(
         default=False,
-        help_text="Whether this channel was automatically created via M3U auto channel sync"
+        help_text="Whether this channel was automatically created via M3U auto channel sync",
     )
     auto_created_by = models.ForeignKey(
         "m3u.M3UAccount",
@@ -353,16 +370,14 @@ class Channel(models.Model):
         null=True,
         blank=True,
         related_name="auto_created_channels",
-        help_text="The M3U account that auto-created this channel"
+        help_text="The M3U account that auto-created this channel",
     )
 
     created_at = models.DateTimeField(
-        auto_now_add=True,
-        help_text="Timestamp when this channel was created"
+        auto_now_add=True, help_text="Timestamp when this channel was created"
     )
     updated_at = models.DateTimeField(
-        auto_now=True,
-        help_text="Timestamp when this channel was last updated"
+        auto_now=True, help_text="Timestamp when this channel was last updated"
     )
 
     def clean(self):
@@ -451,7 +466,9 @@ class Channel(models.Model):
             )
 
             if not default_profile:
-                logger.debug(f"M3U account {m3u_account.id} has no active default profile")
+                logger.debug(
+                    f"M3U account {m3u_account.id} has no active default profile"
+                )
                 continue
 
             profiles = [default_profile] + [
@@ -462,7 +479,7 @@ class Channel(models.Model):
                 has_active_profiles = True
 
                 # Skip backup-only profiles during normal selection
-                # They are only used when DNS resolution fails on primary profiles
+                # They are only used as failover when the primary connection fails
                 if profile.is_backup_only:
                     continue
 
@@ -498,7 +515,9 @@ class Channel(models.Model):
 
         # No available streams - determine specific reason
         if has_streams_but_maxed_out:
-            error_reason = "All active M3U profiles have reached maximum connection limits"
+            error_reason = (
+                "All active M3U profiles have reached maximum connection limits"
+            )
         elif has_active_profiles:
             error_reason = "No compatible active profile found for any assigned stream"
         else:
@@ -634,22 +653,22 @@ class ChannelGroupM3UAccount(models.Model):
     enabled = models.BooleanField(default=True)
     auto_channel_sync = models.BooleanField(
         default=False,
-        help_text='Automatically create/delete channels to match streams in this group'
+        help_text="Automatically create/delete channels to match streams in this group",
     )
     auto_sync_channel_start = models.FloatField(
         null=True,
         blank=True,
-        help_text='Starting channel number for auto-created channels in this group'
+        help_text="Starting channel number for auto-created channels in this group",
     )
     last_seen = models.DateTimeField(
         default=datetime.now,
         db_index=True,
-        help_text='Last time this group was seen in the M3U source during a refresh'
+        help_text="Last time this group was seen in the M3U source during a refresh",
     )
     is_stale = models.BooleanField(
         default=False,
         db_index=True,
-        help_text='Whether this group relationship is stale (not seen in recent refresh, pending deletion)'
+        help_text="Whether this group relationship is stale (not seen in recent refresh, pending deletion)",
     )
 
     class Meta:
@@ -707,6 +726,8 @@ class RecurringRecordingRule(models.Model):
 
     def cleaned_days(self):
         try:
-            return sorted({int(d) for d in (self.days_of_week or []) if 0 <= int(d) <= 6})
+            return sorted(
+                {int(d) for d in (self.days_of_week or []) if 0 <= int(d) <= 6}
+            )
         except Exception:
             return []

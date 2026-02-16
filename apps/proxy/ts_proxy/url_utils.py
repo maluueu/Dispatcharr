@@ -89,10 +89,8 @@ def _try_backup_profiles(stream, m3u_account, redis_client, channel=None):
     Find the first backup-only profile that has connection capacity and
     return its transformed URL.
 
-    This function does **not** perform DNS lookups.  It is intended to be
-    called reactively — after the caller has already observed a DNS or
-    connection failure on the primary profile — so the real connection
-    attempt on the backup URL will validate reachability.
+    Called reactively after a connection failure on the primary profile.
+    The caller validates reachability by actually connecting to the backup URL.
 
     Args:
         stream: The ``Stream`` whose ``.url`` we transform.
@@ -145,15 +143,12 @@ def _try_backup_profiles(stream, m3u_account, redis_client, channel=None):
 
 def get_backup_profile_url(stream_id, channel_id=None):
     """
-    Public helper for the StreamManager to call **reactively** when a DNS
-    resolution failure has been detected on the current stream URL.
+    Public helper for the StreamManager to call **reactively** when a
+    connection failure has been detected on the current stream URL.
 
     Looks up the stream's M3U account, finds the first backup-only profile
     with connection capacity, and returns the transformed URL plus metadata
     needed to update the running connection.
-
-    No proactive DNS lookups are performed — the StreamManager will validate
-    the backup URL by actually connecting to it.
 
     Args:
         stream_id: Primary key of the ``Stream`` that failed.
@@ -317,11 +312,10 @@ def generate_stream_url(channel_id: str) -> Tuple[str, str, bool, Optional[int]]
                 selected_profile.replace_pattern,
             )
 
-            # NOTE: No proactive DNS check here.  DNS failures are detected
+            # NOTE: No proactive connection check here.  Failures are detected
             # reactively by the StreamManager (for proxy/transcode modes) or
             # by validate_stream_url() (for redirect mode).  Backup-only
-            # profiles are attempted by the StreamManager when a DNS error
-            # is observed on the actual connection.
+            # profiles are attempted by the StreamManager on connection failure.
 
             # Check if the stream has its own stream_profile set, otherwise use default
             if stream.stream_profile:
@@ -387,7 +381,7 @@ def generate_stream_url(channel_id: str) -> Tuple[str, str, bool, Optional[int]]
             input_url, m3u_profile.search_pattern, m3u_profile.replace_pattern
         )
 
-        # NOTE: No proactive DNS check.  See comment above re: reactive
+        # NOTE: No proactive connection check.  See comment above re: reactive
         # detection by StreamManager / validate_stream_url().
 
         # Check if transcoding is needed
@@ -565,7 +559,7 @@ def get_stream_info_for_switch(
             stream.url, profile.search_pattern, profile.replace_pattern
         )
 
-        # NOTE: No proactive DNS check.  See generate_stream_url() comment.
+        # NOTE: No proactive connection check.  See generate_stream_url() comment.
 
         # Get transcode info from the channel's stream profile
         stream_profile = channel.get_stream_profile()
@@ -714,7 +708,7 @@ def get_alternate_streams(
                         selected_profile = profile
                         break
 
-                # NOTE: No proactive DNS check on alternate candidates.
+                # NOTE: No proactive connection check on alternate candidates.
                 # The StreamManager (or redirect validation in views.py) will
                 # detect unreachable URLs reactively when connecting.
                 if selected_profile:
