@@ -283,6 +283,7 @@ class StreamManager:
                                     logger.error(f"Could not log reconnection event: {e}")
 
                             # Successfully connected - read stream data until disconnect/error
+                            data_before = self.last_data_time
                             self._process_stream_data()
                             # If we get here, the connection was closed/failed
 
@@ -290,6 +291,21 @@ class StreamManager:
                             # This indicates we had a stable connection for a while before failing
                             connection_duration = time.time() - connection_start_time
                             stable_connection_threshold = 30  # 30 seconds threshold
+
+                            # Detect "instant death": the HTTP reader thread started
+                            # (connection_result=True) but the upstream connection
+                            # failed immediately — no data was ever received and the
+                            # connection lasted < 3 seconds.  Treat this the same as
+                            # a connection failure so backup-only profiles are tried.
+                            no_data_received = self.last_data_time == data_before
+                            instant_death = connection_duration < 3 and no_data_received
+                            if instant_death:
+                                logger.warning(
+                                    f"Connection to {self.url} for channel {self.channel_id} "
+                                    f"died instantly ({connection_duration:.2f}s, no data) "
+                                    f"— treating as connection failure"
+                                )
+                                connection_result = False
 
                             if self.needs_stream_switch:
                                 logger.info(f"Stream needs to switch after {connection_duration:.1f} seconds for channel: {self.channel_id}")
